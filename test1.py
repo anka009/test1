@@ -80,13 +80,20 @@ if uploaded_file:
         cv2.circle(marked, (x, y), radius, bgr_color, line_thickness)
 
     st.image(marked, caption=f"Gefundene Zellkerne: {len(centers)}", use_container_width=True)
+
 # --- Manuelle Zählung & Löschung über Bildklicks ---
+from PIL import Image
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 st.header("🖱️ Manuelle Bearbeitung")
 
-# Bild mit Klick-Erkennung anzeigen
-coords = streamlit_image_coordinates(marked)
+# Bild mit automatisch erkannten Organiden vorbereiten
+marked = image.copy()
+for (x, y) in centers:
+    cv2.circle(marked, (x, y), radius, bgr_color, line_thickness)
+
+# Übergabe an streamlit_image_coordinates (PIL-Image!)
+coords = streamlit_image_coordinates(Image.fromarray(marked))
 
 if coords is not None:
     st.write(f"Klick erkannt bei: ({coords['x']}, {coords['y']})")
