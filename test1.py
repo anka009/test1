@@ -61,14 +61,10 @@ if uploaded_file:
     if st.button("Automatik neu übernehmen"):
         st.session_state.centers = auto_centers.copy()
 
-    # --- CSV-Export ---
-    df = pd.DataFrame(st.session_state.centers, columns=["X", "Y"])
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("📥 CSV exportieren", data=csv, file_name="organoiden.csv", mime="text/csv")
-
     # --- Manuelle Bearbeitung ---
     st.header("🖱️ Manuelle Bearbeitung")
 
+    # Bild mit aktuellen Zentren rendern
     marked = image.copy()
     for (x, y) in st.session_state.centers:
         cv2.circle(marked, (x, y), radius, bgr_color, line_thickness)
@@ -99,9 +95,13 @@ if uploaded_file:
             else:
                 st.info("Kein Organid im Löschradius gefunden.")
 
-    # --- aktualisierte Anzeige ---
+    # --- finale Anzeige & Export ---
     updated = image.copy()
     for (x, y) in st.session_state.centers:
         cv2.circle(updated, (x, y), radius, bgr_color, line_thickness)
 
     st.image(updated, caption=f"Aktuelle Organiden: {len(st.session_state.centers)}", use_container_width=True)
+
+    df = pd.DataFrame(st.session_state.centers, columns=["X", "Y"])
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("📥 CSV exportieren", data=csv, file_name="organoiden.csv", mime="text/csv")
