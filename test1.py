@@ -80,3 +80,41 @@ if uploaded_file:
         cv2.circle(marked, (x, y), radius, bgr_color, line_thickness)
 
     st.image(marked, caption=f"Gefundene Zellkerne: {len(centers)}", use_container_width=True)
+# --- Manuelle Zählung & Löschung über Bildklicks ---
+from streamlit_image_coordinates import streamlit_image_coordinates
+
+st.header("🖱️ Manuelle Bearbeitung")
+
+# Bild mit Klick-Erkennung anzeigen
+coords = streamlit_image_coordinates(marked)
+
+if coords is not None:
+    st.write(f"Klick erkannt bei: ({coords['x']}, {coords['y']})")
+
+    # Auswahl: Hinzufügen oder Löschen
+    action = st.radio("Aktion wählen:", ["Organid hinzufügen", "Organid löschen"])
+
+    if action == "Organid hinzufügen":
+        centers.append((coords["x"], coords["y"]))
+        st.success("Organid manuell hinzugefügt ✅")
+
+    elif action == "Organid löschen":
+        # Nächstgelegenen Punkt zu Klick finden und entfernen
+        def remove_nearest(center_list, click, max_dist=20):
+            cx, cy = click["x"], click["y"]
+            new_list = []
+            for (x, y) in center_list:
+                dist = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+                if dist > max_dist:  # nur behalten, wenn nicht nah am Klick
+                    new_list.append((x, y))
+            return new_list
+
+        centers = remove_nearest(centers, coords)
+        st.success("Nächstgelegener Organid entfernt 🗑️")
+
+# Aktualisiertes Bild mit neuen Zentren anzeigen
+updated = image.copy()
+for (x, y) in centers:
+    cv2.circle(updated, (x, y), radius, bgr_color, line_thickness)
+
+st.image(updated, caption=f"Aktuelle Organiden: {len(centers)}", use_container_width=True)
