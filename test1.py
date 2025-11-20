@@ -82,7 +82,6 @@ if uploaded_file:
     st.image(marked, caption=f"Gefundene Zellkerne: {len(centers)}", use_container_width=True)
 
 # --- Manuelle Zählung & Löschung über Bildklicks ---
-from PIL import Image
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 st.header("🖱️ Manuelle Bearbeitung")
