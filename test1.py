@@ -218,11 +218,11 @@ hsv_disp = cv2.cvtColor(image_disp, cv2.COLOR_RGB2HSV)
 # -------------------- Sidebar --------------------
 st.sidebar.markdown("### ⚙️ Filter & Kalibrierung")
 blur_kernel = ensure_odd(st.sidebar.slider("🔧 Blur (ungerade empfohlen)", 1, 21, 5, step=1))
-min_area = st.sidebar.number_input("📏 Mindestfläche (px)", 10, 2000, 100)
+min_area = st.sidebar.number_input("📏 Mindestfläche (px)", 10, 500, 50)
 # -------------------- DBSCAN-Clustering für Auto-Punkte --------------------
 st.sidebar.markdown("### 🧩 DBSCAN-Clustering für Auto-Punkte")
-cluster_eps = st.sidebar.number_input("Cluster-Radius (eps)", 1, 200, 25)
-cluster_min_samples = st.sidebar.number_input("Min. Punkte pro Cluster", 1, 20, 2)
+cluster_eps = st.sidebar.number_input("Cluster-Radius (eps)", 1, 500, 25)
+cluster_min_samples = st.sidebar.number_input("Min. Punkte pro Cluster", 1, 20, 1)
 
 alpha = st.sidebar.slider("🌗 Alpha (Kontrast)", 0.1, 3.0, 1.0, step=0.1)
 circle_radius = st.sidebar.slider("⚪ Kreisradius (Display-Px)", 1, 20, 5)
