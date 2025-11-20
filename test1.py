@@ -447,3 +447,27 @@ with st.expander("🧠 Debug Info"):
         "last_auto_run": st.session_state.last_auto_run,
         "image_shape": image_disp.shape if isinstance(image_disp, np.ndarray) else None
     })
+
+# -------------------- DBSCAN-CLUSTERING FÜR AUTO-PUNKTE --------------------
+# (Neu hinzugefügt)
+try:
+    from sklearn.cluster import DBSCAN
+    st.sidebar.subheader("DBSCAN‑Clustering für Auto‑Punkte")
+    cluster_eps = st.sidebar.number_input("Cluster‑Radius (eps)", 1, 200, 25)
+    cluster_min_samples = st.sidebar.number_input("Min. Punkte pro Cluster", 1, 20, 2)
+
+    if 'detected_points' in globals() and len(detected_points) > 0:
+        pts = np.array(detected_points)
+        db = DBSCAN(eps=cluster_eps, min_samples=cluster_min_samples).fit(pts)
+        labels = db.labels_
+        clustered = {}
+        for lbl, p in zip(labels, pts):
+            clustered.setdefault(lbl, []).append(p)
+        auto_points = []
+        for lbl, plist in clustered.items():
+            arr = np.array(plist)
+            center = arr.mean(axis=0)
+            auto_points.append(center.astype(int).tolist())
+except Exception as e:
+    st.error(f"DBSCAN konnte nicht ausgeführt werden: {e}")
+
