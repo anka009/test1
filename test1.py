@@ -7,6 +7,23 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 import pandas as pd
 import json
 from pathlib import Path
+from sklearn.cluster import DBSCAN  # sicherstellen, dass importiert ist
+
+def apply_dbscan(points, eps, min_samples):
+    if len(points) == 0:
+        return points
+    pts = np.array(points)
+    db = DBSCAN(eps=eps, min_samples=min_samples).fit(pts)
+    labels = db.labels_
+    clustered = {}
+    for lbl, p in zip(labels, pts):
+        clustered.setdefault(lbl, []).append(p)
+    out = []
+    for plist in clustered.values():
+        arr = np.array(plist)
+        center = arr.mean(axis=0)
+        out.append((int(center[0]), int(center[1])))
+    return out
 
 # -------------------- Hilfsfunktionen --------------------
 
