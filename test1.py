@@ -414,9 +414,6 @@ if st.session_state.last_auto_run > 0:
 clustered_aec = apply_dbscan(detected_aec, cluster_eps, cluster_min_samples)
 clustered_hema = apply_dbscan(detected_hema, cluster_eps, cluster_min_samples)
 
-st.session_state.aec_auto = clustered_aec
-st.session_state.hema_auto = clustered_hema
-    
 # apply dedup once and keep manual points separate
 st.session_state.aec_auto = dedup_points(detected_aec, min_dist=max(4, circle_radius // 2))
 st.session_state.hema_auto = dedup_points(detected_hema, min_dist=max(4, circle_radius // 2))
