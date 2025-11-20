@@ -378,21 +378,21 @@ if st.session_state.last_auto_run > 0:
     detected_aec = get_centers(mask_aec, int(min_area))
     detected_hema = get_centers(mask_hema, int(min_area))
 
-def apply_dbscan(points, eps, min_samples):
-    if len(points) == 0:
-        return points
-    pts = np.array(points)
-    db = DBSCAN(eps=eps, min_samples=min_samples).fit(pts)
-    labels = db.labels_
-    clustered = {}
-    for lbl, p in zip(labels, pts):
-        clustered.setdefault(lbl, []).append(p)
-    out = []
-    for plist in clustered.values():
-        arr = np.array(plist)
-        center = arr.mean(axis=0)
-        out.append((int(center[0]), int(center[1])))
-    return out
+    def apply_dbscan(points, eps, min_samples):
+        if len(points) == 0:
+            return points
+        pts = np.array(points)
+        db = DBSCAN(eps=eps, min_samples=min_samples).fit(pts)
+        labels = db.labels_
+        clustered = {}
+        for lbl, p in zip(labels, pts):
+            clustered.setdefault(lbl, []).append(p)
+        out = []
+        for plist in clustered.values():
+            arr = np.array(plist)
+            center = arr.mean(axis=0)
+            out.append((int(center[0]), int(center[1])))
+        return out
 
 clustered_aec = apply_dbscan(detected_aec, cluster_eps, cluster_min_samples)
 clustered_hema = apply_dbscan(detected_hema, cluster_eps, cluster_min_samples)
