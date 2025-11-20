@@ -6,3 +6,4 @@ numpy
 pandas
 opencv-python-headless
 streamlit-drawable-canvas
+scikit-learn
