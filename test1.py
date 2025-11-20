@@ -367,43 +367,39 @@ if calibrated_any:
 
 # -------------------- Auto-Erkennung (wenn letzte Kalibrierung erfolgte) --------------------
 if st.session_state.last_auto_run > 0:
-    # prepare processed image for detection (apply contrast + blur)
+    # vorbereitete Bildverarbeitung (Kontrast + Blur)
     proc = cv2.convertScaleAbs(image_disp, alpha=alpha, beta=0)
     if blur_kernel > 1:
         proc = cv2.GaussianBlur(proc, (ensure_odd(blur_kernel), ensure_odd(blur_kernel)), 0)
     hsv_proc = cv2.cvtColor(proc, cv2.COLOR_RGB2HSV)
 
-    if st.session_state.aec_hsv is not None:
-        mask_aec = apply_hue_wrap(hsv_proc, *st.session_state.aec_hsv)
-    else:
-        mask_aec = np.zeros(hsv_proc.shape[:2], dtype=np.uint8)
-
-    if st.session_state.hema_hsv is not None:
-        mask_hema = apply_hue_wrap(hsv_proc, *st.session_state.hema_hsv)
-    else:
-        mask_hema = np.zeros(hsv_proc.shape[:2], dtype=np.uint8)
-
-    if st.session_state.bg_hsv is not None:
+    # Maske erstellen
+    mask_aec = apply_hue_wrap(hsv_proc, *st.session_state.aec_hsv) if st.session_state.aec_hsv else np.zeros(hsv_proc.shape[:2], dtype=np.uint8)
+    mask_hema = apply_hue_wrap(hsv_proc, *st.session_state.hema_hsv) if st.session_state.hema_hsv else np.zeros(hsv_proc.shape[:2], dtype=np.uint8)
+    if st.session_state.bg_hsv:
         mask_bg = apply_hue_wrap(hsv_proc, *st.session_state.bg_hsv)
         mask_aec = cv2.bitwise_and(mask_aec, cv2.bitwise_not(mask_bg))
         mask_hema = cv2.bitwise_and(mask_hema, cv2.bitwise_not(mask_bg))
 
+    # Morphologie
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask_aec = cv2.morphologyEx(mask_aec, cv2.MORPH_OPEN, kernel)
     mask_hema = cv2.morphologyEx(mask_hema, cv2.MORPH_OPEN, kernel)
 
+    # Centers erkennen
     detected_aec = get_centers(mask_aec, int(min_area))
     detected_hema = get_centers(mask_hema, int(min_area))
 
-clustered_aec = apply_dbscan(detected_aec, cluster_eps, cluster_min_samples)
-clustered_hema = apply_dbscan(detected_hema, cluster_eps, cluster_min_samples)
+    # DBSCAN-Clustering anwenden
+    clustered_aec = apply_dbscan(detected_aec, cluster_eps, cluster_min_samples)
+    clustered_hema = apply_dbscan(detected_hema, cluster_eps, cluster_min_samples)
 
-# apply dedup once and keep manual points separate
-st.session_state.aec_auto = dedup_points(detected_aec, min_dist=max(4, circle_radius // 2))
-st.session_state.hema_auto = dedup_points(detected_hema, min_dist=max(4, circle_radius // 2))
+    # Deduplication nach Cluster
+    st.session_state.aec_auto = dedup_points(clustered_aec, min_dist=max(4, circle_radius // 2))
+    st.session_state.hema_auto = dedup_points(clustered_hema, min_dist=max(4, circle_radius // 2))
 
-# reset trigger so we don't rerun continuously
-st.session_state.last_auto_run = 0
+    # Trigger zurücksetzen, damit Auto-Erkennung nicht mehrfach läuft
+    st.session_state.last_auto_run = 0
 
 # -------------------- Ergebnisse + Export --------------------
 aec_auto = st.session_state.aec_auto or []
