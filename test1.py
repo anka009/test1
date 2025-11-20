@@ -202,6 +202,11 @@ hsv_disp = cv2.cvtColor(image_disp, cv2.COLOR_RGB2HSV)
 st.sidebar.markdown("### ⚙️ Filter & Kalibrierung")
 blur_kernel = ensure_odd(st.sidebar.slider("🔧 Blur (ungerade empfohlen)", 1, 21, 5, step=1))
 min_area = st.sidebar.number_input("📏 Mindestfläche (px)", 10, 2000, 100)
+# -------------------- DBSCAN-Clustering für Auto-Punkte --------------------
+st.sidebar.markdown("### 🧩 DBSCAN-Clustering für Auto-Punkte")
+cluster_eps = st.sidebar.number_input("Cluster-Radius (eps)", 1, 200, 25)
+cluster_min_samples = st.sidebar.number_input("Min. Punkte pro Cluster", 1, 20, 2)
+
 alpha = st.sidebar.slider("🌗 Alpha (Kontrast)", 0.1, 3.0, 1.0, step=0.1)
 circle_radius = st.sidebar.slider("⚪ Kreisradius (Display-Px)", 1, 20, 5)
 calib_radius = st.sidebar.slider("🎯 Kalibrierungsradius (Pixel)", 1, 15, 5)
@@ -373,6 +378,28 @@ if st.session_state.last_auto_run > 0:
     detected_aec = get_centers(mask_aec, int(min_area))
     detected_hema = get_centers(mask_hema, int(min_area))
 
+def apply_dbscan(points, eps, min_samples):
+    if len(points) == 0:
+        return points
+    pts = np.array(points)
+    db = DBSCAN(eps=eps, min_samples=min_samples).fit(pts)
+    labels = db.labels_
+    clustered = {}
+    for lbl, p in zip(labels, pts):
+        clustered.setdefault(lbl, []).append(p)
+    out = []
+    for plist in clustered.values():
+        arr = np.array(plist)
+        center = arr.mean(axis=0)
+        out.append((int(center[0]), int(center[1])))
+    return out
+
+clustered_aec = apply_dbscan(detected_aec, cluster_eps, cluster_min_samples)
+clustered_hema = apply_dbscan(detected_hema, cluster_eps, cluster_min_samples)
+
+st.session_state.aec_auto = clustered_aec
+st.session_state.hema_auto = clustered_hema
+    
     # apply dedup once and keep manual points separate
     st.session_state.aec_auto = dedup_points(detected_aec, min_dist=max(4, circle_radius // 2))
     st.session_state.hema_auto = dedup_points(detected_hema, min_dist=max(4, circle_radius // 2))
@@ -447,27 +474,4 @@ with st.expander("🧠 Debug Info"):
         "last_auto_run": st.session_state.last_auto_run,
         "image_shape": image_disp.shape if isinstance(image_disp, np.ndarray) else None
     })
-
-# -------------------- DBSCAN-CLUSTERING FÜR AUTO-PUNKTE --------------------
-# (Neu hinzugefügt)
-try:
-    from sklearn.cluster import DBSCAN
-    st.sidebar.subheader("DBSCAN‑Clustering für Auto‑Punkte")
-    cluster_eps = st.sidebar.number_input("Cluster‑Radius (eps)", 1, 200, 25)
-    cluster_min_samples = st.sidebar.number_input("Min. Punkte pro Cluster", 1, 20, 2)
-
-    if 'detected_points' in globals() and len(detected_points) > 0:
-        pts = np.array(detected_points)
-        db = DBSCAN(eps=cluster_eps, min_samples=cluster_min_samples).fit(pts)
-        labels = db.labels_
-        clustered = {}
-        for lbl, p in zip(labels, pts):
-            clustered.setdefault(lbl, []).append(p)
-        auto_points = []
-        for lbl, plist in clustered.items():
-            arr = np.array(plist)
-            center = arr.mean(axis=0)
-            auto_points.append(center.astype(int).tolist())
-except Exception as e:
-    st.error(f"DBSCAN konnte nicht ausgeführt werden: {e}")
 
