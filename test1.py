@@ -1,4 +1,4 @@
-# canvas2_auto_calib_fixed.py
+# canvas2_auto_calib_fixed_deconv.py
 import streamlit as st
 import cv2
 import numpy as np
@@ -8,6 +8,123 @@ import pandas as pd
 import json
 from pathlib import Path
 from sklearn.cluster import DBSCAN  # sicherstellen, dass importiert ist
+
+# -------------------- Hilfsfunktionen (neu: OD & Deconv) --------------------
+
+def od_from_rgb(img_rgb):
+    """Berechnet optische Dichte (OD) aus einem RGB-Bild (uint8)."""
+    # convert to float and avoid zeros
+    imf = img_rgb.astype(np.float32)
+    imf = np.clip(imf, 0, 255)
+    od = -np.log((imf + 1.0) / 255.0)
+    return od  # shape (H,W,3)
+
+def sample_patch_pixels(img_rgb, x, y, radius=5):
+    """Gebe alle RGB-Pixel im Displaybild innerhalb des Patch-Radius zurück."""
+    h, w = img_rgb.shape[:2]
+    x_min = max(0, x - radius)
+    x_max = min(w, x + radius + 1)
+    y_min = max(0, y - radius)
+    y_max = min(h, y + radius + 1)
+    patch = img_rgb[y_min:y_max, x_min:x_max]
+    if patch.size == 0:
+        return np.zeros((0,3), dtype=np.float32)
+    return patch.reshape(-1, 3).astype(np.float32)
+
+def median_od_vector_from_points(img_rgb, points, radius=5):
+    """Ermittelt den medianen OD-Vektor (3,) aus einer Liste von Klickpunkten."""
+    if not points:
+        return None
+    all_pixels = []
+    for (x, y) in points:
+        patch = sample_patch_pixels(img_rgb, x, y, radius)
+        if patch.size > 0:
+            all_pixels.append(patch)
+    if not all_pixels:
+        return None
+    all_pixels = np.vstack(all_pixels)  # N x 3
+    od = -np.log((all_pixels + 1.0) / 255.0)
+    # robust: median pro Kanal
+    med = np.median(od, axis=0)
+    # if near-zero, return None
+    if np.linalg.norm(med) < 1e-6:
+        return None
+    return med
+
+def normalize_vector(v):
+    v = v.astype(np.float32)
+    n = np.linalg.norm(v)
+    if n == 0 or np.isnan(n):
+        return v
+    return v / n
+
+def make_stain_matrix(aec_vec, hema_vec, bg_vec=None):
+    """
+    Baut eine 3x3 'stain matrix' auf, Spalten sind die (normalisierten) OD-Vektoren.
+    Falls nur zwei Vektoren vorhanden, erschaffen wir eine dritte orthogonale approximation (background).
+    """
+    # ensure arrays or fallbacks
+    aec_v = normalize_vector(np.array(aec_vec)) if aec_vec is not None else None
+    hema_v = normalize_vector(np.array(hema_vec)) if hema_vec is not None else None
+
+    if aec_v is None and hema_v is None:
+        return None
+
+    cols = []
+    if aec_v is not None:
+        cols.append(aec_v)
+    if hema_v is not None:
+        # ensure not colinear
+        if aec_v is not None and np.allclose(np.abs(np.dot(aec_v, hema_v)), 1.0, atol=1e-3):
+            # slight jitter to avoid singularity
+            hema_v = hema_v + 1e-3
+            hema_v = normalize_vector(hema_v)
+        cols.append(hema_v)
+
+    # add background vector
+    if bg_vec is not None:
+        bg_v = normalize_vector(np.array(bg_vec))
+        cols.append(bg_v)
+    else:
+        # create third vector orthogonal-ish via cross product if we have >=2
+        if len(cols) >= 2:
+            third = np.cross(cols[0], cols[1])
+            if np.linalg.norm(third) < 1e-6:
+                # fallback: use mean of remaining RGB OD
+                third = np.array([0.01, 0.01, 0.01])
+            third = normalize_vector(third)
+            cols.append(third)
+        else:
+            # single vector case: pick two small orthogonal dims
+            cols.append(normalize_vector(np.array([0.01,0.01,0.01])))
+
+    M = np.column_stack(cols)  # 3x3
+    # ensure invertible-ish by slight regularization if needed
+    if np.linalg.matrix_rank(M) < 3:
+        M = M + np.eye(3) * 1e-6
+    return M
+
+def compute_concentration_maps(od_img, stain_matrix):
+    """
+    od_img: HxWx3
+    stain_matrix: 3x3 (columns: stain vectors)
+    returns: list of HxW concentration maps (len == number of stains == 3)
+    """
+    if stain_matrix is None:
+        h, w = od_img.shape[:2]
+        return [np.zeros((h, w), dtype=np.float32)] * 3
+    # solve concentrations: C = pinv(M) @ OD_pixel
+    pinv = np.linalg.pinv(stain_matrix)  # 3x3
+    h, w = od_img.shape[:2]
+    od_flat = od_img.reshape(-1, 3).T  # 3 x N
+    conc_flat = pinv @ od_flat  # 3 x N
+    conc = conc_flat.T.reshape(h, w, 3)  # H W 3
+    # clamp negatives to zero (concentrations should be >=0)
+    conc = np.maximum(conc, 0.0)
+    maps = [conc[..., i].astype(np.float32) for i in range(3)]
+    return maps
+
+# -------------------- Deine Funktionen wiederverwendet --------------------
 
 def apply_dbscan(points, eps, min_samples):
     if len(points) == 0:
@@ -25,11 +142,8 @@ def apply_dbscan(points, eps, min_samples):
         out.append((int(center[0]), int(center[1])))
     return out
 
-# -------------------- Hilfsfunktionen --------------------
-
 def is_near(p1, p2, r=10):
     return np.linalg.norm(np.array(p1) - np.array(p2)) < r
-
 
 def dedup_points(points, min_dist=6):
     out = []
@@ -37,7 +151,6 @@ def dedup_points(points, min_dist=6):
         if not any(is_near(p, q, r=min_dist) for q in out):
             out.append(p)
     return out
-
 
 def get_centers(mask, min_area=50):
     """Erweiterte Konturenerkennung mit Glättung und Morphologie."""
@@ -59,130 +172,63 @@ def get_centers(mask, min_area=50):
                 centers.append((cx, cy))
     return centers
 
+# -------------------- Save / Load Kalibrierung (angepasst) --------------------
 
-def compute_hsv_range(points, hsv_img, radius=5):
-    """Robuste Median-basierte HSV-Range-Berechnung mit Wrap-Achtung für Hue."""
-    if not points:
-        return None
-    vals = []
-    for (x, y) in points:
-        x_min = max(0, x - radius)
-        x_max = min(hsv_img.shape[1], x + radius + 1)
-        y_min = max(0, y - radius)
-        y_max = min(hsv_img.shape[0], y + radius + 1)
-        region = hsv_img[y_min:y_max, x_min:x_max]
-        if region.size > 0:
-            vals.append(region.reshape(-1, 3))
-    if not vals:
-        return None
-    vals = np.vstack(vals)
-    h = vals[:, 0].astype(int)
-    s = vals[:, 1].astype(int)
-    v = vals[:, 2].astype(int)
-
-    h_med = float(np.median(h))
-    s_med = float(np.median(s))
-    v_med = float(np.median(v))
-
-    n_points = len(points)
-    tol_h = int(min(25, 10 + n_points * 3))
-    tol_s = int(min(80, 30 + n_points * 10))
-    tol_v = int(min(80, 30 + n_points * 10))
-
-    # Hue wrap aware
-    if np.mean(h) > 150 or np.mean(h) < 20:
-        h_adjusted = np.where(h < 90, h + 180, h)
-        h_med = float(np.median(h_adjusted) % 180)
-        tol_h = min(40, tol_h + 5)
-
-    h_min = int(round((h_med - tol_h) % 180))
-    h_max = int(round((h_med + tol_h) % 180))
-    s_min = max(0, int(round(s_med - tol_s)))
-    s_max = min(255, int(round(s_med + tol_s)))
-    v_min = max(0, int(round(v_med - tol_v)))
-    v_max = min(255, int(round(v_med + tol_v)))
-
-    return (h_min, h_max, s_min, s_max, v_min, v_max)
-
-
-def apply_hue_wrap(hsv_img, hmin, hmax, smin, smax, vmin, vmax):
-    # ensure ints and in valid ranges
-    hmin, hmax, smin, smax, vmin, vmax = map(int, (hmin, hmax, smin, smax, vmin, vmax))
-    if hmin <= hmax:
-        mask = cv2.inRange(hsv_img, np.array([hmin, smin, vmin]), np.array([hmax, smax, vmax]))
-    else:
-        mask_lo = cv2.inRange(hsv_img, np.array([0, smin, vmin]), np.array([hmax, smax, vmax]))
-        mask_hi = cv2.inRange(hsv_img, np.array([hmin, smin, vmin]), np.array([179, smax, vmax]))
-        mask = cv2.bitwise_or(mask_lo, mask_hi)
-    return mask
-
-
-def ensure_odd(k):
-    return k if k % 2 == 1 else k + 1
-
-
-def remove_near(points, forbidden_points, r):
-    if not forbidden_points:
-        return points
-    return [p for p in points if not any(is_near(p, q, r) for q in forbidden_points)]
-
-
-def save_last_calibration(path="kalibrierung.json"):
-    def safe_list(val):
-        if isinstance(val, np.ndarray):
-            return val.tolist()
-        elif isinstance(val, list):
-            return val
-        else:
-            return None
+def save_last_calibration(path="kalibrierung_deconv.json"):
     data = {
-        "aec_hsv": safe_list(st.session_state.get("aec_hsv")),
-        "hema_hsv": safe_list(st.session_state.get("hema_hsv")),
-        "bg_hsv": safe_list(st.session_state.get("bg_hsv"))
+        "aec_vec": st.session_state.get("aec_vec").tolist() if st.session_state.get("aec_vec") is not None else None,
+        "hema_vec": st.session_state.get("hema_vec").tolist() if st.session_state.get("hema_vec") is not None else None,
+        "bg_vec": st.session_state.get("bg_vec").tolist() if st.session_state.get("bg_vec") is not None else None,
+        "aec_threshold": float(st.session_state.get("aec_threshold", 0.0)),
+        "hema_threshold": float(st.session_state.get("hema_threshold", 0.0))
     }
     try:
         with open(path, "w") as f:
             json.dump(data, f)
-        st.success("💾 Kalibrierung gespeichert.")
+        st.success("💾 Kalibrierung (Deconv) gespeichert.")
     except Exception as e:
         st.error(f"Fehler beim Speichern: {e}")
 
-
-def load_last_calibration(path="kalibrierung.json"):
+def load_last_calibration(path="kalibrierung_deconv.json"):
     try:
         with open(path, "r") as f:
             data = json.load(f)
-        st.session_state.aec_hsv = np.array(data.get("aec_hsv")) if data.get("aec_hsv") else None
-        st.session_state.hema_hsv = np.array(data.get("hema_hsv")) if data.get("hema_hsv") else None
-        st.session_state.bg_hsv = np.array(data.get("bg_hsv")) if data.get("bg_hsv") else None
-        st.success("✅ Letzte Kalibrierung geladen.")
+        st.session_state.aec_vec = np.array(data.get("aec_vec")) if data.get("aec_vec") else None
+        st.session_state.hema_vec = np.array(data.get("hema_vec")) if data.get("hema_vec") else None
+        st.session_state.bg_vec = np.array(data.get("bg_vec")) if data.get("bg_vec") else None
+        st.session_state.aec_threshold = float(data.get("aec_threshold", 0.0))
+        st.session_state.hema_threshold = float(data.get("hema_threshold", 0.0))
+        st.success("✅ Letzte Deconv-Kalibrierung geladen.")
     except FileNotFoundError:
         st.warning("⚠️ Keine gespeicherte Kalibrierung gefunden.")
     except Exception as e:
         st.error(f"Fehler beim Laden: {e}")
 
 # -------------------- Streamlit Setup --------------------
-st.set_page_config(page_title="Zellkern-Zähler (Auto-Kalib) - Fixed", layout="wide")
-st.title("🧬 Zellkern-Zähler – Auto-Kalibrierung (AEC / Hämatoxylin) — korrigiert")
+st.set_page_config(page_title="Zellkern-Zähler (Deconv Auto-Kalib)", layout="wide")
+st.title("🧬 Zellkern-Zähler – OD + Deconvolution (Auto-Kalib)")
 
 # -------------------- Session State --------------------
 default_lists = [
     "aec_cal_points", "hema_cal_points", "bg_cal_points",
     "aec_auto", "hema_auto",
     "manual_aec", "manual_hema",
-    "aec_hsv", "hema_hsv", "bg_hsv",
-    "last_file", "disp_width", "last_auto_run"
+    "aec_vec", "hema_vec", "bg_vec",
+    "last_file", "disp_width", "last_auto_run",
+    "aec_threshold", "hema_threshold"
 ]
 for key in default_lists:
     if key not in st.session_state:
-        if key in ["aec_hsv", "hema_hsv", "bg_hsv"]:
+        if key in ["aec_vec", "hema_vec", "bg_vec"]:
             st.session_state[key] = None
         elif key == "disp_width":
             st.session_state[key] = 1400
+        elif key in ["aec_threshold", "hema_threshold"]:
+            st.session_state[key] = 0.0
         else:
             st.session_state[key] = []
 
-# per-mode first-click-ignore flags (only these — no global "first_click_ignored")
+# per-mode first-click-ignore flags
 for flag in ["aec_first_ignore", "hema_first_ignore", "bg_first_ignore"]:
     if flag not in st.session_state:
         st.session_state[flag] = True
@@ -197,11 +243,13 @@ if not uploaded_file:
 if uploaded_file.name != st.session_state.last_file:
     for k in ["aec_cal_points", "hema_cal_points", "bg_cal_points", "aec_auto", "hema_auto", "manual_aec", "manual_hema"]:
         st.session_state[k] = []
-    for k in ["aec_hsv", "hema_hsv", "bg_hsv"]:
+    for k in ["aec_vec", "hema_vec", "bg_vec"]:
         st.session_state[k] = None
     st.session_state.last_file = uploaded_file.name
     st.session_state.disp_width = 1400
     st.session_state.last_auto_run = 0
+    st.session_state.aec_threshold = 0.0
+    st.session_state.hema_threshold = 0.0
 
 # -------------------- Bild vorbereiten --------------------
 colW1, colW2 = st.columns([2, 1])
@@ -213,28 +261,38 @@ image_orig = np.array(Image.open(uploaded_file).convert("RGB"))
 H_orig, W_orig = image_orig.shape[:2]
 scale = DISPLAY_WIDTH / W_orig
 image_disp = cv2.resize(image_orig, (DISPLAY_WIDTH, int(H_orig * scale)), interpolation=cv2.INTER_AREA)
-hsv_disp = cv2.cvtColor(image_disp, cv2.COLOR_RGB2HSV)
+
+# OD image (display scale) used for calibration and deconv
+od_disp = od_from_rgb(image_disp)  # H W 3
 
 # -------------------- Sidebar --------------------
-st.sidebar.markdown("### ⚙️ Filter & Kalibrierung")
-blur_kernel = ensure_odd(st.sidebar.slider("🔧 Blur (ungerade empfohlen)", 1, 21, 5, step=1))
+st.sidebar.markdown("### ⚙️ Deconvolution & Kalibrierung")
+blur_kernel = max(1, int(st.sidebar.slider("🔧 Blur (ungerade empfohlen)", 1, 21, 5, step=1)))
 min_area = st.sidebar.number_input("📏 Mindestfläche (px)", 10, 500, 50)
-# -------------------- DBSCAN-Clustering für Auto-Punkte --------------------
+
 st.sidebar.markdown("### 🧩 DBSCAN-Clustering für Auto-Punkte")
 cluster_eps = st.sidebar.number_input("Cluster-Radius (eps)", 1, 500, 25)
 cluster_min_samples = st.sidebar.number_input("Min. Punkte pro Cluster", 1, 20, 1)
 
 alpha = st.sidebar.slider("🌗 Alpha (Kontrast)", 0.1, 3.0, 1.0, step=0.1)
 circle_radius = st.sidebar.slider("⚪ Kreisradius (Display-Px)", 1, 20, 5)
-calib_radius = st.sidebar.slider("🎯 Kalibrierungsradius (Pixel)", 1, 15, 5)
-
-min_points_calib = st.sidebar.slider(
-    "🧮 Minimale Punkte für automatische Kalibrierung",
-    min_value=1, max_value=10, value=3, step=1
-)
+calib_patch_radius = st.sidebar.slider("🎯 OD-Patch-Radius (px)", 1, 20, 5)
+min_points_calib = st.sidebar.slider("🧮 Minimale Punkte für automatische Kalibrierung", 1, 10, 3, step=1)
 st.sidebar.info("Kalibrierung läuft automatisch, sobald die minimale Punktzahl erreicht ist.")
 
-# Modes — exact strings to avoid substring matching
+# Deconv-specific params
+st.sidebar.markdown("### 🔬 Deconv Einstellungen")
+aec_thresh_mul = st.sidebar.slider("AEC Threshold-Multiplikator", 0.1, 5.0, 1.0, step=0.1)
+hema_thresh_mul = st.sidebar.slider("Hämatoxylin Threshold-Multiplikator", 0.1, 5.0, 1.0, step=0.1)
+iter_blend = st.sidebar.slider("Iterative Kalibrierung: Blend-Gewicht (neu vs. alt)", 0.0, 1.0, 0.6, step=0.05)
+
+if st.sidebar.button("🔁 Kalibrierung laden"):
+    load_last_calibration()
+
+if st.sidebar.button("💾 Kalibrierung speichern"):
+    save_last_calibration()
+
+# Modes
 MODES = [
     "AEC Kalibrier-Punkt setzen",
     "Hämatoxylin Kalibrier-Punkt setzen",
@@ -245,7 +303,6 @@ MODES = [
 ]
 mode = st.sidebar.radio("Modus", MODES, index=0)
 
-# boolean flags
 aec_mode = mode == MODES[0]
 hema_mode = mode == MODES[1]
 bg_mode = mode == MODES[2]
@@ -253,7 +310,6 @@ manual_aec_mode = mode == MODES[3]
 manual_hema_mode = mode == MODES[4]
 delete_mode = mode == MODES[5]
 
-# When switching mode, re-enable the respective ignore-flag (only exact matches)
 if "prev_mode" not in st.session_state:
     st.session_state.prev_mode = None
 
@@ -266,7 +322,6 @@ if mode != st.session_state.prev_mode:
         st.session_state.bg_first_ignore = True
     st.session_state.prev_mode = mode
 
-# Quick actions
 if st.sidebar.button("🧹 Alle Punkte löschen"):
     for k in ["aec_cal_points", "hema_cal_points", "bg_cal_points", "aec_auto", "hema_auto", "manual_aec", "manual_hema"]:
         st.session_state[k] = []
@@ -289,7 +344,6 @@ for (x, y) in st.session_state.aec_auto:
 for (x, y) in st.session_state.hema_auto:
     cv2.circle(marked_disp, (x, y), circle_radius, (255, 0, 0), 2)
 
-# KEY: do NOT include last_auto_run in the widget key anymore
 coords = streamlit_image_coordinates(Image.fromarray(marked_disp), key=f"clickable_image_{st.session_state.last_file}", width=DISPLAY_WIDTH)
 
 # -------------------- Klicklogik --------------------
@@ -333,51 +387,86 @@ if coords:
         st.session_state.manual_hema.append((x, y))
         st.info(f"✋ Manuell: Hämatoxylin-Punkt ({x}, {y})")
 
-# Deduplication (once)
+# Deduplication (einmal)
 for k in ["aec_cal_points", "hema_cal_points", "bg_cal_points", "manual_aec", "manual_hema"]:
     st.session_state[k] = dedup_points(st.session_state[k], min_dist=max(4, circle_radius // 2))
 
-# -------------------- Auto-Kalibrierung (sammelt Änderungen und führt genau 1x aus) --------------------
+# -------------------- Auto-Kalibrierung (OD/Deconv) --------------------
 calibrated_any = False
-# compute calibration ranges from display HSV (points are in display coords)
+
+# helper: update/merge vectors iteratively
+def blend_vectors(old, new, weight_new=0.6):
+    if old is None:
+        return new
+    if new is None:
+        return old
+    return normalize_vector((1.0 - weight_new) * old + weight_new * new)
+
 if len(st.session_state.bg_cal_points) >= min_points_calib:
-    hsv_bg = compute_hsv_range(st.session_state.bg_cal_points, hsv_disp, radius=calib_radius)
-    if hsv_bg is not None:
-        st.session_state.bg_hsv = hsv_bg
+    vec_bg = median_od_vector_from_points(image_disp, st.session_state.bg_cal_points, radius=calib_patch_radius)
+    if vec_bg is not None:
+        st.session_state.bg_vec = blend_vectors(st.session_state.bg_vec, vec_bg, weight_new=iter_blend)
         st.session_state.bg_cal_points = []
         calibrated_any = True
 
 if len(st.session_state.aec_cal_points) >= min_points_calib:
-    hsv_aec = compute_hsv_range(st.session_state.aec_cal_points, hsv_disp, radius=calib_radius)
-    if hsv_aec is not None:
-        st.session_state.aec_hsv = hsv_aec
+    vec_aec = median_od_vector_from_points(image_disp, st.session_state.aec_cal_points, radius=calib_patch_radius)
+    if vec_aec is not None:
+        st.session_state.aec_vec = blend_vectors(st.session_state.aec_vec, vec_aec, weight_new=iter_blend)
         st.session_state.aec_cal_points = []
         calibrated_any = True
 
 if len(st.session_state.hema_cal_points) >= min_points_calib:
-    hsv_hema = compute_hsv_range(st.session_state.hema_cal_points, hsv_disp, radius=calib_radius)
-    if hsv_hema is not None:
-        st.session_state.hema_hsv = hsv_hema
+    vec_hema = median_od_vector_from_points(image_disp, st.session_state.hema_cal_points, radius=calib_patch_radius)
+    if vec_hema is not None:
+        st.session_state.hema_vec = blend_vectors(st.session_state.hema_vec, vec_hema, weight_new=iter_blend)
         st.session_state.hema_cal_points = []
         calibrated_any = True
 
 if calibrated_any:
     st.session_state.last_auto_run += 1
-    st.success("✅ Auto-Kalibrierung durchgeführt.")
+    st.success("✅ Deconv-Auto-Kalibrierung durchgeführt.")
 
-# -------------------- Auto-Erkennung (wenn letzte Kalibrierung erfolgte) --------------------
+# -------------------- Auto-Erkennung (Deconv) --------------------
 if st.session_state.last_auto_run > 0:
-    # vorbereitete Bildverarbeitung (Kontrast + Blur)
+    # vorbereitete Bildverarbeitung (Kontrast + optional Blur)
     proc = cv2.convertScaleAbs(image_disp, alpha=alpha, beta=0)
     if blur_kernel > 1:
         proc = cv2.GaussianBlur(proc, (ensure_odd(blur_kernel), ensure_odd(blur_kernel)), 0)
-    hsv_proc = cv2.cvtColor(proc, cv2.COLOR_RGB2HSV)
 
-    # Maske erstellen
-    mask_aec = apply_hue_wrap(hsv_proc, *st.session_state.aec_hsv) if st.session_state.aec_hsv else np.zeros(hsv_proc.shape[:2], dtype=np.uint8)
-    mask_hema = apply_hue_wrap(hsv_proc, *st.session_state.hema_hsv) if st.session_state.hema_hsv else np.zeros(hsv_proc.shape[:2], dtype=np.uint8)
-    if st.session_state.bg_hsv:
-        mask_bg = apply_hue_wrap(hsv_proc, *st.session_state.bg_hsv)
+    od_proc = od_from_rgb(proc)  # H W 3
+
+    # Stain-Matrix bauen
+    M = make_stain_matrix(st.session_state.aec_vec, st.session_state.hema_vec, st.session_state.bg_vec)
+
+    # Konzentrationsmaps
+    conc_maps = compute_concentration_maps(od_proc, M)  # list of 3 maps: [aec_map, hema_map, bg_map-or-other]
+    aec_map = conc_maps[0]
+    hema_map = conc_maps[1]
+    # bg_map = conc_maps[2]  # optional
+
+    # thresholds automatisch bestimmen (robust median)
+    # avoid zero-median by small epsilon
+    aec_med = float(np.median(aec_map[aec_map > 0])) if np.any(aec_map > 0) else float(np.median(aec_map))
+    hema_med = float(np.median(hema_map[hema_map > 0])) if np.any(hema_map > 0) else float(np.median(hema_map))
+
+    if aec_med <= 0:
+        aec_med = np.mean(aec_map) + 1e-6
+    if hema_med <= 0:
+        hema_med = np.mean(hema_map) + 1e-6
+
+    # store thresholds in session (iterative calibration friendly)
+    st.session_state.aec_threshold = aec_med * aec_thresh_mul
+    st.session_state.hema_threshold = hema_med * hema_thresh_mul
+
+    # create masks
+    mask_aec = (aec_map >= st.session_state.aec_threshold).astype(np.uint8) * 255
+    mask_hema = (hema_map >= st.session_state.hema_threshold).astype(np.uint8) * 255
+
+    # remove background via bg_vec if available (optional)
+    if st.session_state.bg_vec is not None:
+        bg_map = conc_maps[2]
+        mask_bg = (bg_map >= (np.median(bg_map[bg_map > 0]) if np.any(bg_map > 0) else 0)).astype(np.uint8) * 255
         mask_aec = cv2.bitwise_and(mask_aec, cv2.bitwise_not(mask_bg))
         mask_hema = cv2.bitwise_and(mask_hema, cv2.bitwise_not(mask_bg))
 
@@ -386,7 +475,7 @@ if st.session_state.last_auto_run > 0:
     mask_aec = cv2.morphologyEx(mask_aec, cv2.MORPH_OPEN, kernel)
     mask_hema = cv2.morphologyEx(mask_hema, cv2.MORPH_OPEN, kernel)
 
-    # Centers erkennen
+    # Centers erkennen (wie vorher)
     detected_aec = get_centers(mask_aec, int(min_area))
     detected_hema = get_centers(mask_hema, int(min_area))
 
@@ -398,7 +487,7 @@ if st.session_state.last_auto_run > 0:
     st.session_state.aec_auto = dedup_points(clustered_aec, min_dist=max(4, circle_radius // 2))
     st.session_state.hema_auto = dedup_points(clustered_hema, min_dist=max(4, circle_radius // 2))
 
-    # Trigger zurücksetzen, damit Auto-Erkennung nicht mehrfach läuft
+    # Trigger zurücksetzen
     st.session_state.last_auto_run = 0
 
 # -------------------- Ergebnisse + Export --------------------
@@ -450,14 +539,16 @@ if rows:
     df = pd.DataFrame(rows)
     df["X_original"] = (df["X_display"] / scale).round().astype("Int64")
     df["Y_original"] = (df["Y_display"] / scale).round().astype("Int64")
-    st.download_button("📥 CSV exportieren", data=df.to_csv(index=False).encode("utf-8"), file_name="zellkerne_v4_fixed.csv", mime="text/csv")
+    st.download_button("📥 CSV exportieren", data=df.to_csv(index=False).encode("utf-8"), file_name="zellkerne_deconv.csv", mime="text/csv")
 
 # Debug
 with st.expander("🧠 Debug Info"):
     st.write({
-        "aec_hsv": st.session_state.aec_hsv,
-        "hema_hsv": st.session_state.hema_hsv,
-        "bg_hsv": st.session_state.bg_hsv,
+        "aec_vec": (st.session_state.aec_vec.tolist() if st.session_state.aec_vec is not None else None),
+        "hema_vec": (st.session_state.hema_vec.tolist() if st.session_state.hema_vec is not None else None),
+        "bg_vec": (st.session_state.bg_vec.tolist() if st.session_state.bg_vec is not None else None),
+        "aec_threshold": st.session_state.aec_threshold,
+        "hema_threshold": st.session_state.hema_threshold,
         "aec_auto_count": len(st.session_state.aec_auto),
         "hema_auto_count": len(st.session_state.hema_auto),
         "manual_aec_count": len(st.session_state.manual_aec),
@@ -468,4 +559,3 @@ with st.expander("🧠 Debug Info"):
         "last_auto_run": st.session_state.last_auto_run,
         "image_shape": image_disp.shape if isinstance(image_disp, np.ndarray) else None
     })
-
