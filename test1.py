@@ -31,25 +31,28 @@ def sample_patch_pixels(img_rgb, x, y, radius=5):
         return np.zeros((0,3), dtype=np.float32)
     return patch.reshape(-1, 3).astype(np.float32)
 
-def median_od_vector_from_points(img_rgb, points, radius=5):
-    """Ermittelt den medianen OD-Vektor (3,) aus einer Liste von Klickpunkten."""
-    if not points:
-        return None
-    all_pixels = []
+def median_od_vector_from_points(img, points, radius=4):
+    vals = []
     for (x, y) in points:
-        patch = sample_patch_pixels(img_rgb, x, y, radius)
-        if patch.size > 0:
-            all_pixels.append(patch)
-    if not all_pixels:
+        patch = extract_patch(img, x, y, radius)  # dein Code
+        if patch is None or patch.size == 0:
+            continue
+
+        od = rgb_to_od(patch)  # dein OD-Converter
+        if np.any(np.isnan(od)):
+            continue
+
+        v = np.median(od.reshape(-1, 3), axis=0)
+        if np.linalg.norm(v) == 0:
+            continue
+
+        vals.append(v)
+
+    if len(vals) == 0:
         return None
-    all_pixels = np.vstack(all_pixels)  # N x 3
-    od = -np.log((all_pixels + 1.0) / 255.0)
-    # robust: median pro Kanal
-    med = np.median(od, axis=0)
-    # if near-zero, return None
-    if np.linalg.norm(med) < 1e-6:
-        return None
-    return med
+
+    return normalize_vector(np.median(vals, axis=0))
+
 
 def normalize_vector(v):
     v = v.astype(np.float32)
@@ -57,18 +60,17 @@ def normalize_vector(v):
     if n == 0 or np.isnan(n):
         return v
     return v / n
+def make_stain_matrix(aec, hema, bg):
+    aec = np.array(aec, dtype=float)
+    hema = np.array(hema, dtype=float)
+    bg = np.array(bg, dtype=float)
 
-def make_stain_matrix(aec_vec, hema_vec, bg_vec=None):
-    """
-    Baut eine 3x3 'stain matrix' auf, Spalten sind die (normalisierten) OD-Vektoren.
-    Falls nur zwei Vektoren vorhanden, erschaffen wir eine dritte orthogonale approximation (background).
-    """
-    # ensure arrays or fallbacks
-    aec_v = normalize_vector(np.array(aec_vec)) if aec_vec is not None else None
-    hema_v = normalize_vector(np.array(hema_vec)) if hema_vec is not None else None
+    if aec.shape != (3,) or hema.shape != (3,) or bg.shape != (3,):
+        raise ValueError("Stain-Vektoren müssen Länge 3 haben")
 
-    if aec_v is None and hema_v is None:
-        return None
+    M = np.stack([aec, hema, bg], axis=1)
+    M = M + np.eye(3) * 1e-6
+    return M
 
     cols = []
     if aec_v is not None:
@@ -401,11 +403,14 @@ calibrated_any = False
 
 # helper: update/merge vectors iteratively
 def blend_vectors(old, new, weight_new=0.6):
-    if old is None:
-        return new
+    if old is None and new is None:
+        return None
     if new is None:
         return old
-    return normalize_vector((1.0 - weight_new) * old + weight_new * new)
+    if old is None:    
+        return normalize_vector(new)
+    mixed = (1.0 - weight_new) * old + weight_new * new
+    return normalize_vector(mixed)
 
 if len(st.session_state.bg_cal_points) >= min_points_calib:
     vec_bg = median_od_vector_from_points(image_disp, st.session_state.bg_cal_points, radius=calib_patch_radius)
@@ -442,6 +447,14 @@ if st.session_state.last_auto_run > 0:
     od_proc = od_from_rgb(proc)  # H W 3
 
     # Stain-Matrix bauen
+if any(v is None for v in [
+    st.session_state.aec_vec,
+    st.session_state.hema_vec,
+    st.session_state.bg_vec
+]):
+    st.warning("⚠️ Bitte zuerst alle drei Stain-Vektoren kalibrieren.")
+    st.stop()
+
     M = make_stain_matrix(st.session_state.aec_vec, st.session_state.hema_vec, st.session_state.bg_vec)
 
     # Konzentrationsmaps
