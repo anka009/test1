@@ -167,62 +167,134 @@ manual_aec_mode = mode==MODES[3]
 manual_hema_mode = mode==MODES[4]
 delete_mode = mode==MODES[5]
 
-# -------------------- Klicklogik --------------------
-coords = streamlit_image_coordinates(Image.fromarray(image_disp), key="clickable_image")
+# -------------------- Klicklogik & iterative OD-Kalib --------------------
 if coords:
-    x,y = int(coords["x"]),int(coords["y"])
+    x, y = int(coords["x"]), int(coords["y"])
+
+    # Punkte löschen
     if delete_mode:
-        for key in ["aec_cal_points","hema_cal_points","bg_cal_points","manual_aec","manual_hema"]:
-            st.session_state[key] = [p for p in st.session_state[key] if not is_near(p,(x,y),circle_radius)]
+        for key in ["aec_cal_points", "hema_cal_points", "bg_cal_points", "manual_aec", "manual_hema"]:
+            st.session_state[key] = [p for p in st.session_state[key] if not is_near(p, (x, y), circle_radius)]
+        st.info("Punkt(e) gelöscht (falls gefunden).")
+
+    # AEC-Kalib
     elif aec_mode:
-        if st.session_state.first_ignore_flags["aec"]:
-            st.session_state.first_ignore_flags["aec"] = False
+        if st.session_state.aec_first_ignore:
+            st.session_state.aec_first_ignore = False
+            st.info("⏳ Erster AEC-Klick ignoriert (Initialisierung).")
         else:
-            st.session_state.aec_cal_points.append((x,y))
+            st.session_state.aec_cal_points.append((x, y))
+            st.info(f"📍 AEC-Kalibrierpunkt hinzugefügt ({x}, {y})")
+
+    # Hämatoxylin-Kalib
     elif hema_mode:
-        if st.session_state.first_ignore_flags["hema"]:
-            st.session_state.first_ignore_flags["hema"] = False
+        if st.session_state.hema_first_ignore:
+            st.session_state.hema_first_ignore = False
+            st.info("⏳ Erster Hämatoxylin-Klick ignoriert (Initialisierung).")
         else:
-            st.session_state.hema_cal_points.append((x,y))
+            st.session_state.hema_cal_points.append((x, y))
+            st.info(f"📍 Hämatoxylin-Kalibrierpunkt hinzugefügt ({x}, {y})")
+
+    # Hintergrund-Kalib
     elif bg_mode:
-        if st.session_state.first_ignore_flags["bg"]:
-            st.session_state.first_ignore_flags["bg"] = False
+        if st.session_state.bg_first_ignore:
+            st.session_state.bg_first_ignore = False
+            st.info("⏳ Erster Hintergrund-Klick ignoriert (Initialisierung).")
         else:
-            st.session_state.bg_cal_points.append((x,y))
+            st.session_state.bg_cal_points.append((x, y))
+            st.info(f"📍 Hintergrund-Kalibrierpunkt hinzugefügt ({x}, {y})")
+
+    # Manuelle Punkte
     elif manual_aec_mode:
-        st.session_state.manual_aec.append((x,y))
+        st.session_state.manual_aec.append((x, y))
+        st.info(f"✋ Manuell: AEC-Punkt ({x}, {y})")
+
     elif manual_hema_mode:
-        st.session_state.manual_hema.append((x,y))
+        st.session_state.manual_hema.append((x, y))
+        st.info(f"✋ Manuell: Hämatoxylin-Punkt ({x}, {y})")
 
-for k in ["aec_cal_points","hema_cal_points","bg_cal_points","manual_aec","manual_hema"]:
-    st.session_state[k] = dedup_points(st.session_state[k], min_dist=max(4,circle_radius//2))
+# Deduplication
+for k in ["aec_cal_points", "hema_cal_points", "bg_cal_points", "manual_aec", "manual_hema"]:
+    st.session_state[k] = dedup_points(st.session_state[k], min_dist=max(4, circle_radius // 2))
 
-# -------------------- OD/Deconv Auto-Kalibrierung --------------------
+# -------------------- Iterative OD Auto-Kalibrierung --------------------
 calibrated_any = False
-if len(st.session_state.bg_cal_points)>=min_points_calib:
-    vec_bg = median_od_vector_from_points(image_disp, st.session_state.bg_cal_points, radius=calib_patch_radius)
-    if vec_bg is not None:
-        st.session_state.bg_vec = blend_vectors(st.session_state.bg_vec, vec_bg, weight_new=iter_blend)
-        st.session_state.bg_cal_points = []
-        calibrated_any = True
 
-if len(st.session_state.aec_cal_points)>=min_points_calib:
-    vec_aec = median_od_vector_from_points(image_disp, st.session_state.aec_cal_points, radius=calib_patch_radius)
-    if vec_aec is not None:
-        st.session_state.aec_vec = blend_vectors(st.session_state.aec_vec, vec_aec, weight_new=iter_blend)
-        st.session_state.aec_cal_points = []
-        calibrated_any = True
+def blend_vectors(old, new, weight_new=0.6):
+    if old is None:
+        return new
+    if new is None:
+        return old
+    return normalize_vector((1.0 - weight_new) * old + weight_new * new)
 
-if len(st.session_state.hema_cal_points)>=min_points_calib:
-    vec_hema = median_od_vector_from_points(image_disp, st.session_state.hema_cal_points, radius=calib_patch_radius)
-    if vec_hema is not None:
-        st.session_state.hema_vec = blend_vectors(st.session_state.hema_vec, vec_hema, weight_new=iter_blend)
-        st.session_state.hema_cal_points = []
-        calibrated_any = True
+# Calib-Patches berechnen & iterativ aktualisieren
+for color, key_points, key_vec in [
+    ("bg", st.session_state.bg_cal_points, "bg_vec"),
+    ("aec", st.session_state.aec_cal_points, "aec_vec"),
+    ("hema", st.session_state.hema_cal_points, "hema_vec")
+]:
+    if len(key_points) >= min_points_calib:
+        vec = median_od_vector_from_points(image_disp, key_points, radius=calib_patch_radius)
+        if vec is not None:
+            st.session_state[key_vec] = blend_vectors(st.session_state.get(key_vec), vec, weight_new=iter_blend)
+            st.session_state[key_points] = []
+            calibrated_any = True
 
 if calibrated_any:
-    st.session_state.last_auto_run = 0
-    st.success("✅ Deconv-Auto-Kalibrierung durchgeführt.")
+    st.session_state.last_auto_run += 1
+    st.success("✅ Iterative Deconv-Kalibrierung durchgeführt.")
+
+# -------------------- Ergebnis + Live Counts + CSV --------------------
+aec_auto = st.session_state.aec_auto or []
+aec_manual = st.session_state.manual_aec or []
+hema_auto = st.session_state.hema_auto or []
+hema_manual = st.session_state.manual_hema or []
+
+st.markdown("### 📊 Anzahl erkannter Punkte")
+colA, colB = st.columns(2)
+with colA:
+    st.metric("AEC (auto)", len(aec_auto))
+    st.metric("AEC (manuell)", len(aec_manual))
+with colB:
+    st.metric("Hämatoxylin (auto)", len(hema_auto))
+    st.metric("Hämatoxylin (manuell)", len(hema_manual))
+
+st.markdown(f"**Gesamtpunkte:** {len(aec_auto)+len(aec_manual)+len(hema_auto)+len(hema_manual)}")
+
+# Ergebnisbild
+result_img = image_disp.copy()
+for (x, y) in aec_auto:
+    cv2.circle(result_img, (x, y), circle_radius, (0, 0, 255), 2)
+for (x, y) in hema_auto:
+    cv2.circle(result_img, (x, y), circle_radius, (255, 0, 0), 2)
+for (x, y) in aec_manual:
+    cv2.circle(result_img, (x, y), circle_radius, (0, 165, 255), -1)
+for (x, y) in hema_manual:
+    cv2.circle(result_img, (x, y), circle_radius, (128, 0, 128), -1)
+
+st.image(result_img, caption="Erkannte Punkte (auto = Outline, manuell = filled)", use_column_width=True)
+
+# CSV Export
+rows = []
+for x, y in aec_auto:
+    rows.append({"X_display": x, "Y_display": y, "Type": "AEC", "Source": "auto"})
+for x, y in aec_manual:
+    rows.append({"X_display": x, "Y_display": y, "Type": "AEC", "Source": "manual"})
+for x, y in hema_auto:
+    rows.append({"X_display": x, "Y_display": y, "Type": "Hämatoxylin", "Source": "auto"})
+for x, y in hema_manual:
+    rows.append({"X_display": x, "Y_display": y, "Type": "Hämatoxylin", "Source": "manual"})
+
+if rows:
+    df = pd.DataFrame(rows)
+    df["X_original"] = (df["X_display"] / scale).round().astype("Int64")
+    df["Y_original"] = (df["Y_display"] / scale).round().astype("Int64")
+    st.download_button(
+        "📥 CSV exportieren",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="zellkerne_iterative.csv",
+        mime="text/csv"
+    )
 
 # -------------------- Auto-Erkennung --------------------
 if all(v is not None for v in [st.session_state.aec_vec, st.session_state.hema_vec, st.session_state.bg_vec]):
