@@ -397,104 +397,75 @@ if coords:
 # Deduplication (einmal)
 for k in ["aec_cal_points", "hema_cal_points", "bg_cal_points", "manual_aec", "manual_hema"]:
     st.session_state[k] = dedup_points(st.session_state[k], min_dist=max(4, circle_radius // 2))
-# -------------------- OD/Deconvolution-Kalibrierung --------------------
-
+# -------------------- Auto-Erkennung auf OD/Deconv --------------------
+import cv2
 import numpy as np
 
-# Helper: Patch extrahieren
-def extract_patch(img, x, y, radius=4):
+def deconvolve_image(img, M):
+    """
+    Deconvolution: RGB -> OD -> Stain separation
+    M: 3x3 Stain-Matrix
+    """
     H, W = img.shape[:2]
-    x_min = max(0, x - radius)
-    x_max = min(W, x + radius + 1)
-    y_min = max(0, y - radius)
-    y_max = min(H, y + radius + 1)
-    if x_min >= x_max or y_min >= y_max:
-        return None
-    return img[y_min:y_max, x_min:x_max]
-
-# Helper: RGB -> Optical Density
-def rgb_to_od(patch, eps=1e-6):
-    patch = patch.astype(np.float32)
-    return -np.log((patch + eps) / 255.0)
-
-# Helper: Vektor normalisieren
-def normalize_vector(v):
-    v = np.array(v, dtype=float)
-    norm = np.linalg.norm(v)
-    if norm == 0:
-        return v
-    return v / norm
-
-# Median OD-Vektor aus mehreren Punkten berechnen
-def median_od_vector_from_points(img, points, radius=4):
-    vals = []
-    for (x, y) in points:
-        patch = extract_patch(img, x, y, radius)
-        if patch is None or patch.size == 0:
-            continue
-        od_patch = rgb_to_od(patch)
-        v = np.median(od_patch.reshape(-1, 3), axis=0)
-        if np.linalg.norm(v) == 0 or np.any(np.isnan(v)):
-            continue
-        vals.append(v)
-    if len(vals) == 0:
-        return None
-    return normalize_vector(np.median(vals, axis=0))
-
-# Helper: alte + neue Vektoren iterativ mischen
-def blend_vectors(old, new, weight_new=0.6):
-    if old is None and new is None:
-        return None
-    if old is None:
-        return normalize_vector(new)
-    if new is None:
-        return old
-    mixed = (1.0 - weight_new) * old + weight_new * new
-    return normalize_vector(mixed)
-
-# --- Iterative Kalibrierung ---
-calibrated_any = False
-
-if len(st.session_state.bg_cal_points) >= min_points_calib:
-    vec_bg = median_od_vector_from_points(image_disp, st.session_state.bg_cal_points, radius=calib_patch_radius)
-    if vec_bg is not None:
-        st.session_state.bg_vec = blend_vectors(st.session_state.bg_vec, vec_bg, weight_new=iter_blend)
-        st.session_state.bg_cal_points = []
-        calibrated_any = True
-
-if len(st.session_state.aec_cal_points) >= min_points_calib:
-    vec_aec = median_od_vector_from_points(image_disp, st.session_state.aec_cal_points, radius=calib_patch_radius)
-    if vec_aec is not None:
-        st.session_state.aec_vec = blend_vectors(st.session_state.aec_vec, vec_aec, weight_new=iter_blend)
-        st.session_state.aec_cal_points = []
-        calibrated_any = True
-
-if len(st.session_state.hema_cal_points) >= min_points_calib:
-    vec_hema = median_od_vector_from_points(image_disp, st.session_state.hema_cal_points, radius=calib_patch_radius)
-    if vec_hema is not None:
-        st.session_state.hema_vec = blend_vectors(st.session_state.hema_vec, vec_hema, weight_new=iter_blend)
-        st.session_state.hema_cal_points = []
-        calibrated_any = True
-
-if calibrated_any:
-    st.session_state.last_auto_run += 1
-    st.success("✅ Deconv-Auto-Kalibrierung durchgeführt.")
-
-# --- Sicherer Aufruf von make_stain_matrix ---
-if all(v is not None for v in [st.session_state.aec_vec, st.session_state.hema_vec, st.session_state.bg_vec]):
+    OD = -np.log((img.astype(np.float32) + 1e-6)/255.0).reshape(-1, 3)
     try:
-        M = make_stain_matrix(
-            st.session_state.aec_vec,
-            st.session_state.hema_vec,
-            st.session_state.bg_vec
-        )
-    except Exception as e:
-        st.error(f"Fehler beim Erstellen der Stain-Matrix: {e}")
-        M = None
-else:
-    st.info("Bitte alle drei Stain-Vektoren per Klick kalibrieren.")
-    M = None
+        C = np.linalg.lstsq(M, OD.T, rcond=None)[0]  # 3xN
+    except np.linalg.LinAlgError:
+        return None
+    return C.T.reshape(H, W, 3)
 
+# Trigger nur, wenn alle Vektoren gesetzt und last_auto_run == 0
+if all(v is not None for v in [st.session_state.aec_vec, st.session_state.hema_vec, st.session_state.bg_vec]):
+    if st.session_state.last_auto_run == 0:
+        # Stain-Matrix
+        try:
+            M = make_stain_matrix(st.session_state.aec_vec, st.session_state.hema_vec, st.session_state.bg_vec)
+        except Exception as e:
+            st.error(f"Fehler bei Stain-Matrix: {e}")
+            M = None
+
+        if M is not None:
+            # Deconvolution
+            C = deconvolve_image(image_disp, M)
+            if C is not None:
+                # Background unterdrücken: simple threshold auf BG-Kanal
+                bg_od = C[:, :, 2]
+                mask_bg = bg_od < np.median(bg_od) * 1.2
+
+                # Schwellen für AEC und Hema (zentrale Werte)
+                aec_od = C[:, :, 0]
+                hema_od = C[:, :, 1]
+
+                # Maske = pixels, die deutlich stärker als Hintergrund sind
+                mask_aec = (aec_od > np.median(aec_od[mask_bg]) + 0.05) & mask_bg
+                mask_hema = (hema_od > np.median(hema_od[mask_bg]) + 0.05) & mask_bg
+
+                # Morphologische Glättung
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                mask_aec = cv2.morphologyEx(mask_aec.astype(np.uint8)*255, cv2.MORPH_OPEN, kernel)
+                mask_hema = cv2.morphologyEx(mask_hema.astype(np.uint8)*255, cv2.MORPH_OPEN, kernel)
+
+                # Centers erkennen
+                detected_aec = get_centers(mask_aec, min_area=int(min_area))
+                detected_hema = get_centers(mask_hema, min_area=int(min_area))
+
+                # DBSCAN-Clustering anwenden
+                clustered_aec = apply_dbscan(detected_aec, cluster_eps, cluster_min_samples)
+                clustered_hema = apply_dbscan(detected_hema, cluster_eps, cluster_min_samples)
+
+                # Deduplication nach Cluster
+                st.session_state.aec_auto = dedup_points(clustered_aec, min_dist=max(4, circle_radius//2))
+                st.session_state.hema_auto = dedup_points(clustered_hema, min_dist=max(4, circle_radius//2))
+
+                # Trigger zurücksetzen, damit Auto-Erkennung nicht mehrfach läuft
+                st.session_state.last_auto_run = 1
+
+            else:
+                st.warning("Deconvolution fehlgeschlagen.")
+        else:
+            st.warning("Stain-Matrix konnte nicht erstellt werden.")
+else:
+    st.info("Bitte zuerst alle drei Kalibrier-Vektoren setzen (AEC/Hema/BG).")
 
 # -------------------- Auto-Erkennung (Deconv) --------------------
 if st.session_state.last_auto_run > 0:
