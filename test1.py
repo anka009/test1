@@ -203,6 +203,11 @@ def load_last_calibration(path="kalibrierung_deconv.json"):
         st.warning("⚠️ Keine gespeicherte Kalibrierung gefunden.")
     except Exception as e:
         st.error(f"Fehler beim Laden: {e}")
+def ensure_odd(k: int) -> int:
+    """Sorgt dafür, dass Kernelgrößen ungerade sind (1,3,5,7...)."""
+    if k < 1:
+        return 1
+    return k if k % 2 == 1 else k + 1
 
 # -------------------- Streamlit Setup --------------------
 st.set_page_config(page_title="Zellkern-Zähler (Deconv Auto-Kalib)", layout="wide")
