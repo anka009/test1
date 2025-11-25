@@ -397,20 +397,63 @@ if coords:
 # Deduplication (einmal)
 for k in ["aec_cal_points", "hema_cal_points", "bg_cal_points", "manual_aec", "manual_hema"]:
     st.session_state[k] = dedup_points(st.session_state[k], min_dist=max(4, circle_radius // 2))
+# -------------------- OD/Deconvolution-Kalibrierung --------------------
 
-# -------------------- Auto-Kalibrierung (OD/Deconv) --------------------
-calibrated_any = False
+import numpy as np
 
-# helper: update/merge vectors iteratively
+# Helper: Patch extrahieren
+def extract_patch(img, x, y, radius=4):
+    H, W = img.shape[:2]
+    x_min = max(0, x - radius)
+    x_max = min(W, x + radius + 1)
+    y_min = max(0, y - radius)
+    y_max = min(H, y + radius + 1)
+    if x_min >= x_max or y_min >= y_max:
+        return None
+    return img[y_min:y_max, x_min:x_max]
+
+# Helper: RGB -> Optical Density
+def rgb_to_od(patch, eps=1e-6):
+    patch = patch.astype(np.float32)
+    return -np.log((patch + eps) / 255.0)
+
+# Helper: Vektor normalisieren
+def normalize_vector(v):
+    v = np.array(v, dtype=float)
+    norm = np.linalg.norm(v)
+    if norm == 0:
+        return v
+    return v / norm
+
+# Median OD-Vektor aus mehreren Punkten berechnen
+def median_od_vector_from_points(img, points, radius=4):
+    vals = []
+    for (x, y) in points:
+        patch = extract_patch(img, x, y, radius)
+        if patch is None or patch.size == 0:
+            continue
+        od_patch = rgb_to_od(patch)
+        v = np.median(od_patch.reshape(-1, 3), axis=0)
+        if np.linalg.norm(v) == 0 or np.any(np.isnan(v)):
+            continue
+        vals.append(v)
+    if len(vals) == 0:
+        return None
+    return normalize_vector(np.median(vals, axis=0))
+
+# Helper: alte + neue Vektoren iterativ mischen
 def blend_vectors(old, new, weight_new=0.6):
     if old is None and new is None:
         return None
+    if old is None:
+        return normalize_vector(new)
     if new is None:
         return old
-    if old is None:    
-        return normalize_vector(new)
     mixed = (1.0 - weight_new) * old + weight_new * new
     return normalize_vector(mixed)
+
+# --- Iterative Kalibrierung ---
+calibrated_any = False
 
 if len(st.session_state.bg_cal_points) >= min_points_calib:
     vec_bg = median_od_vector_from_points(image_disp, st.session_state.bg_cal_points, radius=calib_patch_radius)
@@ -436,6 +479,22 @@ if len(st.session_state.hema_cal_points) >= min_points_calib:
 if calibrated_any:
     st.session_state.last_auto_run += 1
     st.success("✅ Deconv-Auto-Kalibrierung durchgeführt.")
+
+# --- Sicherer Aufruf von make_stain_matrix ---
+if all(v is not None for v in [st.session_state.aec_vec, st.session_state.hema_vec, st.session_state.bg_vec]):
+    try:
+        M = make_stain_matrix(
+            st.session_state.aec_vec,
+            st.session_state.hema_vec,
+            st.session_state.bg_vec
+        )
+    except Exception as e:
+        st.error(f"Fehler beim Erstellen der Stain-Matrix: {e}")
+        M = None
+else:
+    st.info("Bitte alle drei Stain-Vektoren per Klick kalibrieren.")
+    M = None
+
 
 # -------------------- Auto-Erkennung (Deconv) --------------------
 if st.session_state.last_auto_run > 0:
