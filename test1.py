@@ -29,76 +29,59 @@ def extract_patch(img, x, y, radius=5):
     patch = img[y_min:y_max, x_min:x_max]
     return patch
 
-def median_od_vector_from_patch(patch, eps=1e-6):
-    """Compute normalized median OD vector from RGB patch."""
+# -------------------- Robustere OD-Vektor-Bestimmung --------------------
+def median_od_vector_from_patch(patch, top_fraction=0.25, eps=1e-6):
+    """Compute normalized median OD vector using only strongest OD pixels."""
     if patch is None or patch.size == 0:
         return None
     patch = patch.astype(np.float32)
-    OD = -np.log((patch + eps) / 255.0)
-    vec = np.median(OD.reshape(-1, 3), axis=0)
+    OD = -np.log((patch + eps) / 255.0)  # OD
+    flat = OD.reshape(-1, 3)
+    mag = np.linalg.norm(flat, axis=1)
+    k = max(5, int(len(mag) * top_fraction))
+    idx = np.argsort(-mag)[:k]
+    vec = np.median(flat[idx], axis=0)
     norm = np.linalg.norm(vec)
     if norm <= 1e-8 or np.any(np.isnan(vec)):
         return None
     return (vec / norm).astype(np.float32)
 
-def normalize_vector(v):
-    v = np.array(v, dtype=float)
-    n = np.linalg.norm(v)
-    return (v / n).astype(float) if n > 1e-12 else v
-
-def make_stain_matrix(target_vec, hema_vec, bg_vec=None):
+# -------------------- Kontur-basierte Kern-Detektion --------------------
+def detect_centers_from_channel(channel, threshold=0.2, min_area=8, min_circularity=0.4):
     """
-    Build 3x3 stain matrix: columns are [target, hematoxylin, background].
-    If bg_vec is None, use orthogonal vector via cross product.
+    Detect nuclei centers using contours, thresholding, morphology, and circularity filter.
     """
-    t = normalize_vector(target_vec)
-    h = normalize_vector(hema_vec)
-    if bg_vec is None:
-        bg = np.cross(t, h)
-        bg = normalize_vector(bg)
-    else:
-        bg = normalize_vector(bg_vec)
-    M = np.column_stack([t, h, bg]).astype(np.float32)
-    # small regularization
-    M = M + np.eye(3, dtype=np.float32) * 1e-6
-    return M
-
-def deconvolve(img_rgb, M):
-    """Return concentrations image (H,W,3) from RGB using pseudo-inverse of M."""
-    img = img_rgb.astype(np.float32)
-    OD = -np.log((img + 1e-6) / 255.0).reshape(-1, 3)  # N x 3
-    try:
-        pinv = np.linalg.pinv(M)  # 3x3
-        C = (pinv @ OD.T).T  # N x 3
-    except Exception:
-        return None
-    return C.reshape(img_rgb.shape)
-
-def detect_centers_from_channel(channel, threshold, min_area):
-    """Binarize channel, morphology, contour centers -> list of (x,y)."""
-    arr = channel.copy()
-    # ensure non-negative
-    arr = np.maximum(arr, 0.0)
-    # normalize to [0,1] roughly (use percentile)
-    vmin, vmax = np.percentile(arr, [5, 99.5])
-    if vmax - vmin <= 1e-6:
-        norm = (arr - vmin)
-    else:
+    arr = np.maximum(channel, 0.0)
+    
+    # robust percentile clipping
+    vmin, vmax = np.percentile(arr, [1, 98])
+    if vmax - vmin > 1e-6:
         norm = (arr - vmin) / (vmax - vmin)
+    else:
+        norm = arr - vmin
     mask = (norm >= threshold).astype(np.uint8) * 255
+    
+    # Morphology: Open → Close → Dilate
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     centers = []
     for c in contours:
         area = cv2.contourArea(c)
-        if area >= max(1, min_area):
-            M = cv2.moments(c)
-            if M["m00"] != 0:
-                cx = int(round(M["m10"] / M["m00"]))
-                cy = int(round(M["m01"] / M["m00"]))
-                centers.append((cx, cy))
+        if area < max(1, min_area):
+            continue
+        perimeter = cv2.arcLength(c, True)
+        circularity = 4 * np.pi * area / (perimeter * perimeter + 1e-9)
+        if circularity < min_circularity:
+            continue
+        M = cv2.moments(c)
+        if M["m00"] != 0:
+            cx = int(round(M["m10"] / M["m00"]))
+            cy = int(round(M["m01"] / M["m00"]))
+            centers.append((cx, cy))
     return centers, mask
 
 # -------------------- Session state --------------------
@@ -172,48 +155,60 @@ coords = streamlit_image_coordinates(Image.fromarray(display_canvas),
 
 # -------------------- Click logic --------------------
 mode = st.sidebar.radio("Aktion", ["Kalibriere und zähle Gruppe (Klick)", "Punkt löschen"])
+
 if coords:
     x, y = int(coords["x"]), int(coords["y"])
+
     if mode == "Punkt löschen":
         # remove from all_points and groups
         st.session_state.all_points = [p for p in st.session_state.all_points if not is_near(p, (x, y), dedup_dist)]
         for g in st.session_state.groups:
             g["points"] = [p for p in g["points"] if not is_near(p, (x, y), dedup_dist)]
         st.success("Punkt(e) gelöscht")
-    else:
-        # 1) extract patch and compute local OD vector
+
+    else:  # Kalibriere und zähle Gruppe
         patch = extract_patch(image_disp, x, y, calib_radius)
-        vec = median_od_vector_from_patch(patch)
-        if vec is None:
-            st.warning("Patch unbrauchbar (zu homogen oder außerhalb). Bitte anders klicken.")
+        patch_brightness = patch.mean()
+        if patch_brightness > 230:
+            st.warning("Patch zu hell — bitte dunkleres Kernzentrum anklicken.")
         else:
-            # 2) Build stain matrix using clicked vector as 'target' and hematoxylin default
-            #    Use hema_vec0 from sidebar as hematoxylin initial guess
-            M = make_stain_matrix(vec, hema_vec0)
-            # 3) deconvolve entire display image
-            C = deconvolve(image_disp, M)
-            if C is None:
-                st.error("Deconvolution fehlgeschlagen (numerisch).")
+            # 1) Robust OD-Vektor aus Patch
+            vec = median_od_vector_from_patch(patch)
+            if vec is None:
+                st.warning("Patch unbrauchbar (zu homogen oder außerhalb). Bitte anders klicken.")
             else:
-                # We use component 0 (the 'target' vector from click)
-                channel = C[:, :, 0]
-                # detect centers on this channel
-                centers, mask = detect_centers_from_channel(channel, threshold=detection_threshold, min_area=min_area)
-                # 4) remove any centers already counted globally
-                new_centers = dedup_new_points(centers, st.session_state.all_points, min_dist=dedup_dist)
-                if new_centers:
-                    # add new group with random color
-                    color = tuple(int(v) for v in (np.random.randint(60, 230, 3).tolist()))
-                    st.session_state.groups.append({
-                        "vec": vec.tolist(),
-                        "points": new_centers,
-                        "color": color
-                    })
-                    # add to global unique list
-                    st.session_state.all_points.extend(new_centers)
-                    st.success(f"Gruppe hinzugefügt — neue Kerne: {len(new_centers)}")
+                # 2) Build stain matrix mit Hematoxylin default
+                M = make_stain_matrix(vec, hema_vec0)
+                # 3) Deconvolution
+                C = deconvolve(image_disp, M)
+                if C is None:
+                    st.error("Deconvolution fehlgeschlagen (numerisch).")
                 else:
-                    st.info("Keine neuen Kerne (alle bereits gezählt).")
+                    # 4) Wähle Kanal mit stärkster Streuung (Target vs Hema)
+                    c0_std = np.std(C[:, :, 0])
+                    c1_std = np.std(C[:, :, 1])
+                    use_ch = 0 if c0_std > c1_std else 1
+                    channel = C[:, :, use_ch]
+
+                    # 5) Konturbasierte Kern-Detektion
+                    centers, mask = detect_centers_from_channel(channel, threshold=detection_threshold, min_area=min_area)
+
+                    # 6) Neue Zentren deduplizieren (globale Punkte)
+                    new_centers = dedup_new_points(centers, st.session_state.all_points, min_dist=dedup_dist)
+
+                    if new_centers:
+                        # 7) Gruppe hinzufügen mit zufälliger Farbe
+                        color = tuple(int(v) for v in np.random.randint(60, 230, 3))
+                        st.session_state.groups.append({
+                            "vec": vec.tolist(),
+                            "points": new_centers,
+                            "color": color
+                        })
+                        # 8) Globale Punkte aktualisieren
+                        st.session_state.all_points.extend(new_centers)
+                        st.success(f"Gruppe hinzugefügt — neue Kerne: {len(new_centers)}")
+                    else:
+                        st.info("Keine neuen Kerne (alle bereits gezählt).")
 
 # -------------------- Show results & summary --------------------
 st.markdown("## Ergebnisse")
