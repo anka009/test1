@@ -251,37 +251,54 @@ if all(v is not None for v in [st.session_state.aec_vec, st.session_state.hema_v
                                                           min_dist=max(4,circle_radius//2))
                 st.session_state.last_auto_run = 1
 
-# -------------------- Ergebnisse --------------------
+# -------------------- Ergebnisse + Export (mit Live-Zahlen) --------------------
+aec_auto = st.session_state.aec_auto or []
+aec_manual = st.session_state.manual_aec or []
+hema_auto = st.session_state.hema_auto or []
+hema_manual = st.session_state.manual_hema or []
+
+st.markdown("### 📊 Anzahl erkannter Punkte")
+colA, colB = st.columns(2)
+with colA:
+    st.metric("AEC (auto)", len(aec_auto))
+    st.metric("AEC (manuell)", len(aec_manual))
+with colB:
+    st.metric("Hämatoxylin (auto)", len(hema_auto))
+    st.metric("Hämatoxylin (manuell)", len(hema_manual))
+
+st.markdown(f"**Gesamtpunkte:** {len(aec_auto)+len(aec_manual)+len(hema_auto)+len(hema_manual)}")
+
+# Ergebnisbild mit allen Markierungen
 result_img = image_disp.copy()
-for (x,y) in st.session_state.aec_auto:
-    cv2.circle(result_img,(x,y),circle_radius,(0,0,255),2)
-for (x,y) in st.session_state.hema_auto:
-    cv2.circle(result_img,(x,y),circle_radius,(255,0,0),2)
-for (x,y) in st.session_state.manual_aec:
-    cv2.circle(result_img,(x,y),circle_radius,(0,165,255),-1)
-for (x,y) in st.session_state.manual_hema:
-    cv2.circle(result_img,(x,y),circle_radius,(128,0,128),-1)
+for (x, y) in aec_auto:
+    cv2.circle(result_img, (x, y), circle_radius, (0, 0, 255), 2)
+for (x, y) in hema_auto:
+    cv2.circle(result_img, (x, y), circle_radius, (255, 0, 0), 2)
+for (x, y) in aec_manual:
+    cv2.circle(result_img, (x, y), circle_radius, (0, 165, 255), -1)
+for (x, y) in hema_manual:
+    cv2.circle(result_img, (x, y), circle_radius, (128, 0, 128), -1)
 
-st.image(result_img, caption="Erkannte Punkte (auto=outline, manuell=filled)", use_column_width=True)
+st.image(result_img, caption="Erkannte Punkte (auto = Outline, manuell = filled)", use_column_width=True)
 
+# CSV export
 rows = []
-for x,y in st.session_state.aec_auto:
-    rows.append({"X_display":x,"Y_display":y,"Type":"AEC","Source":"auto"})
-for x,y in st.session_state.manual_aec:
-    rows.append({"X_display":x,"Y_display":y,"Type":"AEC","Source":"manual"})
-for x,y in st.session_state.hema_auto:
-    rows.append({"X_display":x,"Y_display":y,"Type":"Hämatoxylin","Source":"auto"})
-for x,y in st.session_state.manual_hema:
-    rows.append({"X_display":x,"Y_display":y,"Type":"Hämatoxylin","Source":"manual"})
+for x, y in aec_auto:
+    rows.append({"X_display": x, "Y_display": y, "Type": "AEC", "Source": "auto"})
+for x, y in aec_manual:
+    rows.append({"X_display": x, "Y_display": y, "Type": "AEC", "Source": "manual"})
+for x, y in hema_auto:
+    rows.append({"X_display": x, "Y_display": y, "Type": "Hämatoxylin", "Source": "auto"})
+for x, y in hema_manual:
+    rows.append({"X_display": x, "Y_display": y, "Type": "Hämatoxylin", "Source": "manual"})
 
 if rows:
     df = pd.DataFrame(rows)
-    df["X_original"] = (df["X_display"]/scale).round().astype("Int64")
-    df["Y_original"] = (df["Y_display"]/scale).round().astype("Int64")
-    st.download_button("📥 CSV exportieren", data=df.to_csv(index=False).encode("utf-8"), file_name="zellkerne_od.csv", mime="text/csv")
-st.markdown("### 📊 Anzahl erkannter Punkte")
-st.write(f"AEC auto: {len(st.session_state.aec_auto)}")
-st.write(f"AEC manuell: {len(st.session_state.manual_aec)}")
-st.write(f"Hämatoxylin auto: {len(st.session_state.hema_auto)}")
-st.write(f"Hämatoxylin manuell: {len(st.session_state.manual_hema)}")
-st.write(f"Gesamt: {len(st.session_state.aec_auto)+len(st.session_state.manual_aec)+len(st.session_state.hema_auto)+len(st.session_state.manual_hema)}")
+    df["X_original"] = (df["X_display"] / scale).round().astype("Int64")
+    df["Y_original"] = (df["Y_display"] / scale).round().astype("Int64")
+    st.download_button(
+        "📥 CSV exportieren",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="zellkerne_v5.csv",
+        mime="text/csv"
+    )
