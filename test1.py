@@ -11,7 +11,6 @@ def is_near(p1, p2, r=5):
     return np.linalg.norm(np.array(p1) - np.array(p2)) < r
 
 def dedup_points(points, existing_points, min_dist=5):
-    """Nur Punkte zurückgeben, die noch nicht in existing_points sind."""
     out = []
     for p in points:
         if not any(is_near(p, e, min_dist) for e in existing_points):
@@ -26,11 +25,9 @@ def extract_patch(img, x, y, radius=5):
     return img[y_min:y_max, x_min:x_max]
 
 def median_od_vector_from_patch(patch):
-    """Berechne OD-Vektor aus RGB-Patch."""
-    # Konvertiere zu OD: OD = -log((I+1)/255)
     patch = patch.astype(np.float32)
     od = -np.log((patch + 1) / 255)
-    vec = np.median(od.reshape(-1, 3), axis=0)
+    vec = np.median(od.reshape(-1,3), axis=0)
     norm = np.linalg.norm(vec)
     if norm > 0:
         vec /= norm
@@ -44,11 +41,9 @@ def normalize_vector(v):
     return v / norm
 
 def make_stain_matrix(aec_vec, hema_vec, bg_vec=None):
-    """Erstelle 3x3 Stain-Matrix. Wenn bg_vec fehlt, orthogonaler Vektor."""
     aec_vec = normalize_vector(aec_vec)
     hema_vec = normalize_vector(hema_vec)
     if bg_vec is None:
-        # bg = Kreuzprodukt von aec und hema
         bg_vec = np.cross(aec_vec, hema_vec)
         bg_vec = normalize_vector(bg_vec)
     else:
@@ -58,15 +53,13 @@ def make_stain_matrix(aec_vec, hema_vec, bg_vec=None):
     return M
 
 def deconvolve(img_rgb, stain_matrix):
-    """Unmix RGB nach Stain-Matrix (simple OD-deconvolution)."""
     img_rgb = img_rgb.astype(np.float32)
     OD = -np.log((img_rgb + 1) / 255)
     M_inv = np.linalg.pinv(stain_matrix)
-    C = OD.reshape(-1, 3) @ M_inv.T
+    C = OD.reshape(-1,3) @ M_inv.T
     return C.reshape(img_rgb.shape)
 
 def detect_nuclei(deconv_channel, threshold=0.2, min_area=5):
-    """Simple Binarisierung + Konturenerkennung."""
     mask = (deconv_channel > threshold).astype(np.uint8) * 255
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     centers = []
@@ -113,9 +106,11 @@ mode = st.sidebar.radio("Aktion", ["Kalibriere und zähle Kern", "Punkt löschen
 
 calib_patch_radius = st.sidebar.slider("Kalibrier-Radius (px)", 1, 10, 5)
 circle_radius = st.sidebar.slider("Kreisradius", 1, 10, 5)
+threshold = st.sidebar.slider("OD-Threshold für Kern", 0.05, 1.0, 0.2, 0.01)
+min_area = st.sidebar.slider("Min. Fläche (px)", 1, 50, 5)
 
+# -------------------- Anzeige bisher gezählter Punkte --------------------
 marked_disp = image_disp.copy()
-# Alle bisher gezählten Punkte anzeigen
 for group in st.session_state.groups:
     for (x, y) in group["points"]:
         cv2.circle(marked_disp, (x, y), circle_radius, group["color"], -1)
@@ -133,12 +128,11 @@ if coords:
     else:
         patch = extract_patch(image_disp, x, y, calib_patch_radius)
         vec = median_od_vector_from_patch(patch)
-        # einfache OD-Deconvolution für alle Pixel
-        M = make_stain_matrix(vec, vec)  # aec=hema=vec für demo
+        # Echte OD-Deconvolution AEC/Hema
+        M = make_stain_matrix(vec, vec)  # AEC/Hema hier gleich für Demo
         deconv = deconvolve(image_disp, M)
-        channel = deconv[:,:,0]  # nutze erste Stain-Komponente
-        detected = detect_nuclei(channel, threshold=0.1)
-        # Deduplication: nur neue Punkte
+        channel = deconv[:,:,0]  # erste Stain-Komponente
+        detected = detect_nuclei(channel, threshold=threshold, min_area=min_area)
         new_points = dedup_points(detected, st.session_state.all_points, min_dist=circle_radius)
         if new_points:
             st.session_state.all_points.extend(new_points)
@@ -157,11 +151,19 @@ for group in st.session_state.groups:
 
 st.image(marked_disp, caption="Gezählte Kerne", use_column_width=True)
 
+# -------------------- Zusammenfassung --------------------
+st.markdown("### Zusammenfassung")
+total_unique = len(st.session_state.all_points)
+st.write(f"💠 Gesamtkerne (unique): {total_unique}")
+
+for i, group in enumerate(st.session_state.groups):
+    st.write(f"Gruppe {i+1} – Kerne: {len(group['points'])}")
+
 # -------------------- CSV Export --------------------
 if st.session_state.all_points:
     rows = []
     for i, group in enumerate(st.session_state.groups):
         for x, y in group["points"]:
-            rows.append({"X_display": x, "Y_display": y, "Group": i})
+            rows.append({"X_display": x, "Y_display": y, "Group": i+1})
     df = pd.DataFrame(rows)
     st.download_button("CSV exportieren", df.to_csv(index=False).encode("utf-8"), file_name="kerne.csv")
