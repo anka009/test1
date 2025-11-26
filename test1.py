@@ -1,4 +1,4 @@
-# canvas_iterative_deconv_blobs_v1.py
+# canvas_iterative_deconv_blobs_v2.py
 import streamlit as st
 import numpy as np
 import cv2
@@ -97,17 +97,26 @@ if uploaded_file.name != st.session_state.last_file:
 
 col1, col2 = st.columns([2,1])
 with col2:
+    st.sidebar.markdown("### Allgemeine Parameter")
     calib_radius = st.sidebar.slider("Kalibrier-Radius px",1,30,5)
     circle_radius = st.sidebar.slider("Marker-Radius px (Display)",1,12,5)
     dedup_dist_display = st.sidebar.slider("Min. Distanz Doppelzählung px",1,40,6)
     hema_default = st.sidebar.text_input("Hematoxylin vector","0.65,0.70,0.29")
     aec_default = st.sidebar.text_input("Chromogen vector","0.27,0.57,0.78")
+    
+    st.sidebar.markdown("### Blob-Detection Parameter")
+    min_sigma = st.sidebar.slider("min_sigma", 1.0, 10.0, 2.0, 0.5)
+    max_sigma = st.sidebar.slider("max_sigma", 1.0, 15.0, 6.0, 0.5)
+    num_sigma = st.sidebar.slider("num_sigma", 1, 10, 5)
+    threshold = st.sidebar.slider("threshold", 0.01, 0.2, 0.03, 0.005)
+    
     try:
         hema_vec0 = np.array([float(x) for x in hema_default.split(",")])
         aec_vec0 = np.array([float(x) for x in aec_default.split(",")])
     except:
         hema_vec0 = np.array([0.65,0.70,0.29])
         aec_vec0 = np.array([0.27,0.57,0.78])
+
 with col1:
     DISPLAY_WIDTH = st.slider("Anzeige-Breite px",300,1600,st.session_state.disp_width)
     st.session_state.disp_width = DISPLAY_WIDTH
@@ -201,7 +210,11 @@ if coords:
             else:
                 C_full=st.session_state.C_cache
             channel_full=C_full[:,:,0]
-            points=detect_blobs(channel_full,min_sigma=2,max_sigma=6,threshold=0.03)
+            points=detect_blobs(channel_full,
+                                min_sigma=min_sigma,
+                                max_sigma=max_sigma,
+                                num_sigma=num_sigma,
+                                threshold=threshold)
             new_points=dedup_new_points(points,st.session_state.all_points,min_dist=dedup_dist_orig)
             if new_points:
                 color=(np.random.randint(50,230),np.random.randint(50,230),np.random.randint(50,230))
