@@ -1,7 +1,4 @@
-# canvas_iterative_deconv_v2_hybrid.py
-# Hybrid-Version: Konturen + LoG-Blob-Detection integriert
-# (vollständig ersetzt & integriert)
-
+# canvas_iterative_deconv_v2_hybrid_full.py
 import streamlit as st
 import numpy as np
 import cv2
@@ -103,7 +100,6 @@ def detect_contours(channel, threshold=0.2, min_area=8):
                 centers.append((cx, cy))
     return centers
 
-# NEW: Blob-LoG detection
 def detect_blob_log(channel, min_sigma=1, max_sigma=6, num_sigma=8, threshold=0.03):
     arr = np.maximum(channel.astype(float), 0)
     vmin, vmax = np.percentile(arr, [2, 99.5])
@@ -112,7 +108,7 @@ def detect_blob_log(channel, min_sigma=1, max_sigma=6, num_sigma=8, threshold=0.
     norm = np.clip((arr - vmin) / (vmax - vmin), 0, 1)
     blobs = blob_log(norm, min_sigma=min_sigma, max_sigma=max_sigma,
                      num_sigma=num_sigma, threshold=threshold)
-    centers = [(int(round(y)), int(round(x))) for y, x, s in blobs]
+    centers = [(int(round(x)), int(round(y))) for y, x, s in blobs]
     return centers
 
 # -------------------- Session State --------------------
@@ -127,7 +123,6 @@ uploaded_file = st.file_uploader("Bild hochladen", type=["jpg", "png", "tif", "t
 if not uploaded_file:
     st.stop()
 
-# initialize for new file
 if uploaded_file.name != st.session_state.last_file:
     st.session_state.groups = []
     st.session_state.all_points = []
@@ -172,18 +167,6 @@ area_scale = 1 / (scale * scale)
 min_area_orig = max(1, int(min_area_display * area_scale))
 dedup_orig = dedup_display / scale
 
-# -------------------- Draw Points --------------------
-PRESET_COLORS = [(220,20,60),(0,128,0),(30,144,255),(255,165,0),(148,0,211),(0,255,255)]
-display_canvas = image_disp.copy()
-for i, g in enumerate(st.session_state.groups):
-    col = PRESET_COLORS[i % len(PRESET_COLORS)]
-    for (xo, yo) in g["points"]:
-        xd, yd = int(xo*scale), int(yo*scale)
-        cv2.circle(display_canvas, (xd,yd), circle_r, col, -1)
-
-coords = streamlit_image_coordinates(Image.fromarray(display_canvas),
-                                    key=f"img_{uploaded_file.name}", width=DISPLAY_WIDTH)
-
 # -------------------- Mode --------------------
 mode = st.sidebar.radio("Aktion", ["Kalibriere & Zähle","Punkt löschen","Undo"])
 if st.sidebar.button("Reset"):
@@ -191,3 +174,61 @@ if st.sidebar.button("Reset"):
         "groups": st.session_state.groups.copy(),
         "all_points": st.session_state.all_points.copy()}))
     st.session_state.groups=[]
+    st.session_state.all_points=[]
+    st.experimental_rerun()
+
+# -------------------- Klick-Handling --------------------
+display_canvas = image_disp.copy()
+for i, g in enumerate(st.session_state.groups):
+    col = [(220,20,60),(0,128,0),(30,144,255),(255,165,0),(148,0,211),(0,255,255)][i % 6]
+    for (xo, yo) in g["points"]:
+        xd, yd = int(xo*scale), int(yo*scale)
+        cv2.circle(display_canvas, (xd,yd), circle_r, col, -1)
+
+coords = streamlit_image_coordinates(Image.fromarray(display_canvas),
+                                    key=f"img_{uploaded_file.name}", width=DISPLAY_WIDTH)
+
+if coords is not None:
+    x_click, y_click = coords["x"]/scale, coords["y"]/scale
+    if mode == "Kalibriere & Zähle":
+        st.session_state.history.append(("add_point", {
+            "groups": [g.copy() for g in st.session_state.groups],
+            "all_points": st.session_state.all_points.copy()
+        }))
+        st.session_state.all_points.append((x_click, y_click))
+    elif mode == "Punkt löschen":
+        # lösche nächstgelegenen Punkt
+        for g in st.session_state.groups:
+            new_pts = [p for p in g["points"] if not is_near(p, (x_click, y_click), dedup_orig)]
+            g["points"] = new_pts
+
+# -------------------- Hybrid Detection --------------------
+if mode == "Kalibriere & Zähle":
+    M = make_stain_matrix(chrom_vec, hema_vec)
+    C = deconvolve(image_orig, M)
+    if C is not None:
+        # wähle Channel für Detection (z.B. Chromogen)
+        channel = C[:,:,0]
+        pts_contour = detect_contours(channel, threshold=threshold_ui, min_area=min_area_orig)
+        pts_blob = detect_blob_log(channel, threshold=blob_thr, max_sigma=blob_sigma)
+        pts_all = dedup_new_points(pts_contour + pts_blob, st.session_state.all_points, dedup_orig)
+        if pts_all:
+            st.session_state.history.append(("add_detected",{
+                "groups": [g.copy() for g in st.session_state.groups],
+                "all_points": st.session_state.all_points.copy()
+            }))
+            st.session_state.all_points.extend(pts_all)
+
+# -------------------- Gruppen aktualisieren --------------------
+# Hier nur 1 Gruppe für alle Punkte
+st.session_state.groups = [{"points": st.session_state.all_points.copy()}]
+
+# -------------------- Display aktualisieren --------------------
+display_canvas = image_disp.copy()
+for i, g in enumerate(st.session_state.groups):
+    col = [(220,20,60),(0,128,0),(30,144,255),(255,165,0),(148,0,211),(0,255,255)][i % 6]
+    for (xo, yo) in g["points"]:
+        xd, yd = int(xo*scale), int(yo*scale)
+        cv2.circle(display_canvas, (xd,yd), circle_r, col, -1)
+
+st.image(display_canvas, caption=f"{len(st.session_state.all_points)} Punkte gefunden", use_column_width=True)
