@@ -54,7 +54,7 @@ def dedup_new_points_kdtree(candidates, existing, min_dist=6.0):
     cand = np.array(candidates, dtype=float)
     if existing and SCIPY_AVAILABLE:
         tree = cKDTree(np.array(existing, dtype=float))
-        dists, _ = tree.query(cand, k=1, n_jobs=-1)
+        dists, _ = tree.query(cand, k=1, workers=-1)
         mask = dists >= min_dist
         return [tuple(map(int, map(round, p))) for p in cand[mask]]
     elif not existing:
