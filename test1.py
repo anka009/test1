@@ -7,7 +7,7 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 import pandas as pd
 
 st.set_page_config(page_title="Iterative Kern-Zählung (OD + Deconv) — v2", layout="wide")
-st.title("🧬 Iterative Kern-Zählung — Version 2)")
+st.title("🧬 Iterative Kern-Zählung — V.2")
 
 # -------------------- Hilfsfunktionen --------------------
 def is_near(p1, p2, r=6):
