@@ -1,4 +1,4 @@
-# canvas_iterative_cnn_v3_auto.py
+# canvas_iterative_cnn_v3_auto_fixed.py
 import streamlit as st
 import numpy as np
 import cv2
@@ -9,37 +9,32 @@ from skimage.morphology import remove_small_objects, remove_small_holes
 from skimage.measure import label, regionprops
 from streamlit_image_coordinates import streamlit_image_coordinates
 
-st.set_page_config(page_title="Iterative Kern-Zählung — CNN Auto V3", layout="wide")
-st.title("🧬 Iterative Kern-Zählung — CNN Auto V3")
+st.set_page_config(page_title="Iterative Kern-Zählung — CNN Auto V3 Fixed", layout="wide")
+st.title("🧬 Iterative Kern-Zählung — CNN Auto V3 Fixed")
+
+# -------------------- Konstante für Modellinput --------------------
+MODEL_INPUT_SIZE = 256  # fix für U-Net Input
 
 # -------------------- Hilfsfunktionen --------------------
-def prepare_patch_for_model(patch, target_size=(256,256)):
-    """
-    Wandelt beliebiges Patch in korrektes U-Net Input-Batch um:
-    - Resize
-    - Graustufen
-    - Normalisierung
-    - Batch/Channel-Dimension hinzufügen
-    """
+def prepare_patch_for_model(patch, target_size=(MODEL_INPUT_SIZE, MODEL_INPUT_SIZE)):
+    """Resize + Graustufen + Norm + Batch dim"""
     patch_resized = cv2.resize(patch, target_size, interpolation=cv2.INTER_AREA)
-    if patch_resized.ndim == 3 and patch_resized.shape[2] == 3:
+    if patch_resized.ndim==3 and patch_resized.shape[2]==3:
         patch_gray = cv2.cvtColor(patch_resized, cv2.COLOR_RGB2GRAY)
     else:
         patch_gray = patch_resized
     patch_gray = patch_gray.astype(np.float32)/255.0
-    batch = patch_gray[np.newaxis, ..., np.newaxis]
+    batch = patch_gray[np.newaxis,...,np.newaxis]
     return batch
 
 def dedup_new_points(candidates, existing, min_dist=6):
-    """Return candidates not within min_dist of existing points."""
     out = []
     for c in candidates:
         if not any(np.linalg.norm(np.array(c)-np.array(e))<min_dist for e in existing):
             out.append(c)
     return out
 
-def build_unet(input_shape=(256,256,1), base_filters=32, depth=4):
-    """Small U-Net für Zentrumserkennung"""
+def build_unet(input_shape=(MODEL_INPUT_SIZE,MODEL_INPUT_SIZE,1), base_filters=32, depth=4):
     inputs = layers.Input(shape=input_shape)
     x = inputs
     skips = []
@@ -66,14 +61,12 @@ def build_unet(input_shape=(256,256,1), base_filters=32, depth=4):
     return model
 
 def postprocess_mask(mask, min_size=5):
-    """Postprocessing: kleine Objekte entfernen, kleine Löcher schließen"""
     mask_bool = mask>0
     mask_clean = remove_small_objects(mask_bool, min_size=min_size)
     mask_clean = remove_small_holes(mask_clean, area_threshold=min_size)
     return mask_clean.astype(np.uint8)
 
 def find_centers_from_mask(mask):
-    """Extrahiere Pixel-Zentren aus binärer Maske"""
     lbl = label(mask)
     centers = []
     for r in regionprops(lbl):
@@ -85,7 +78,7 @@ def find_centers_from_mask(mask):
 for k in ["groups","all_points","last_file","disp_width","history","model"]:
     if k not in st.session_state:
         if k in ["groups","all_points","history"]:
-            st.session_state[k] = []
+            st.session_state[k]=[]
         elif k=="disp_width":
             st.session_state[k]=1000
         else:
@@ -108,7 +101,7 @@ with col2:
     st.sidebar.markdown("### Parameter")
     circle_radius = st.sidebar.slider("Marker-Radius (px, Display)",1,12,5)
     detection_threshold = st.sidebar.slider("Threshold für CNN-Detektion",0.01,0.99,0.5,0.01)
-    patch_size = st.sidebar.slider("Patch-Größe für CNN (px)",64,256,128,16)
+    patch_stride = st.sidebar.slider("Patch-Stride (px, Overlap)",32,256,128,16)
     min_object_size = st.sidebar.slider("Min. Objektgröße (px)",1,50,5)
 with col1:
     DISPLAY_WIDTH = st.slider("Anzeige-Breite (px)",300,1600,st.session_state.disp_width)
@@ -132,12 +125,12 @@ for i,g in enumerate(st.session_state.groups):
         cv2.circle(display_canvas,(x_disp,y_disp),circle_radius,col,-1)
 
 coords = streamlit_image_coordinates(Image.fromarray(display_canvas),
-                                     key=f"clickable_image_cnn_{st.session_state.last_file}",
+                                     key=f"clickable_image_cnn_fixed_{st.session_state.last_file}",
                                      width=DISPLAY_WIDTH)
 
 # -------------------- Load or build model --------------------
 if st.session_state.model is None:
-    st.session_state.model=build_unet()
+    st.session_state.model = build_unet()
     st.success("CNN-Modell bereit.")
 
 # -------------------- Sidebar actions --------------------
@@ -151,25 +144,22 @@ if st.sidebar.button("Reset (Alle Gruppen)"):
 # -------------------- Auto-CNN-Erkennung --------------------
 if mode=="Automatische Kern-Erkennung":
     st.info("CNN läuft über das ganze Bild...")
-    # Patch-Pooling
-    stride = patch_size//2
+    stride = patch_stride
     mask_total = np.zeros((H_orig,W_orig),dtype=np.float32)
-    for y in range(0,H_orig, stride):
-        for x in range(0,W_orig, stride):
-            y0 = y
-            x0 = x
-            y1 = min(y+patch_size,H_orig)
-            x1 = min(x+patch_size,W_orig)
-            patch = image_orig[y0:y1,x0:x1]
-            batch = prepare_patch_for_model(patch,target_size=(patch_size,patch_size))
-            pred = st.session_state.model.predict(batch)[0,...,0]
-            pred_resized = cv2.resize(pred,(x1-x0,y1-y0),interpolation=cv2.INTER_LINEAR)
+    for y in range(0,H_orig,stride):
+        for x in range(0,W_orig,stride):
+            y0=y
+            x0=x
+            y1=min(y+MODEL_INPUT_SIZE,H_orig)
+            x1=min(x+MODEL_INPUT_SIZE,W_orig)
+            patch=image_orig[y0:y1,x0:x1]
+            batch=prepare_patch_for_model(patch,target_size=(MODEL_INPUT_SIZE,MODEL_INPUT_SIZE))
+            pred=st.session_state.model.predict(batch,verbose=0)[0,...,0]
+            pred_resized=cv2.resize(pred,(x1-x0,y1-y0),interpolation=cv2.INTER_LINEAR)
             mask_total[y0:y1,x0:x1] = np.maximum(mask_total[y0:y1,x0:x1], pred_resized)
-    # Postprocessing + Threshold
     mask_bin = (mask_total>detection_threshold).astype(np.uint8)
     mask_clean = postprocess_mask(mask_bin, min_size=min_object_size)
     centers = find_centers_from_mask(mask_clean)
-    # Dedup
     new_centers = dedup_new_points(centers, st.session_state.all_points, min_dist=5)
     if new_centers:
         color=PRESET_COLORS[len(st.session_state.groups)%len(PRESET_COLORS)]
@@ -179,18 +169,16 @@ if mode=="Automatische Kern-Erkennung":
     else:
         st.info("Keine neuen Kerne erkannt.")
 
-# -------------------- Click handling (manual) --------------------
+# -------------------- Click handling --------------------
 if coords and mode=="Manuelle Korrektur (Klick)":
     x_disp,y_disp=int(coords["x"]),int(coords["y"])
     x_orig=int(round(x_disp/scale))
     y_orig=int(round(y_disp/scale))
-    # Füge Punkt hinzu
     color=PRESET_COLORS[len(st.session_state.groups)%len(PRESET_COLORS)]
     st.session_state.groups.append({"points":[(x_orig,y_orig)],"color":color})
     st.session_state.all_points.append((x_orig,y_orig))
     st.success("Punkt hinzugefügt.")
 
-# Punkt löschen
 if coords and mode=="Punkt löschen":
     x_disp,y_disp=int(coords["x"]),int(coords["y"])
     x_orig=int(round(x_disp/scale))
@@ -211,7 +199,6 @@ if coords and mode=="Punkt löschen":
     else:
         st.info("Kein Punkt in der Nähe gefunden.")
 
-# Undo letzte Aktion
 if st.sidebar.button("Undo letzte Aktion"):
     if st.session_state.history:
         action,payload=st.session_state.history.pop()
@@ -242,4 +229,4 @@ with colB:
                 rows.append({"Group":i+1,"X_display":x_disp,"Y_display":y_disp,"X_original":x_orig,"Y_original":y_orig})
         df=pd.DataFrame(rows)
         st.download_button("📥 CSV exportieren",df.to_csv(index=False).encode("utf-8"),
-                           file_name="kern_gruppen_v3_auto.csv",mime="text/csv")
+                           file_name="kern_gruppen_v3_auto_fixed.csv",mime="text/csv")
