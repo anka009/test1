@@ -1,17 +1,20 @@
-# canvas_iterative_deconv_v3.py
+# canvas_iterative_deconv_v3_cnn.py
 """
-V.3 — Robustere, schnellere Iterative Kern-Zählung
-Changelog (gegenüber v2):
-- stabilere Stain-Matrix via orthogonalisierung (SVD/Gram-Schmidt fallback)
-- robustere Patch-OD-Schätzung (Top-perzentil + median)
-- Sauvola-Threshold (falls skimage verfügbar) mit Fallback auf adaptives CV2
-- Mask-Berechnung auf downsampled Kanal + Rückskalierung der Zentren (viel schneller)
-- Dedup via KDTree (scipy) mit Numpy-Fallback (sort+window) — vermeidet O(n^2)
-- Undo/History speichert präzise Gruppen-Zuordnung beim Löschen
-- Precomputed log LUT für schnellere Deconvolution
-- mehr defensive checks + klarere Status-Messages
+V3-CNN: Full Streamlit app for nucleus detection using a Small U-Net
+Features (based on your choices):
+- Small U-Net (M-sized ~1-3M params)
+- Train / Fine-tune inside the app from user-uploaded images+masks
+- Live inference on uploaded images with intelligent tiling (auto-scaling)
+- Auto-Threshold (Otsu on predicted probability) + Auto-Postprocessing (small-object removal)
+- Auto-Calibration (simple intensity/stain normalization per-image)
+- Manual correction UI: click to add/remove centers; undo history
+- CSV export of detected centers
 
-Benutzt: streamlit, numpy, cv2, PIL, pandas. Optional: skimage, scipy
+Notes:
+- Requires TensorFlow (>=2.x) for training/inference. The app will show a fallback message if TF is not installed.
+- Uses predictable memory-friendly tiling, batching and caching of predictions.
+- Model and weights are saved locally (model.h5) after training and loaded for inference.
+
 """
 
 import streamlit as st
@@ -19,513 +22,379 @@ import numpy as np
 import cv2
 from PIL import Image
 import pandas as pd
-from pathlib import Path
+import os
 import math
+import io
+import tempfile
 import json
+from typing import List, Tuple
 
-# optional imports
+# Optional heavy deps
+TF_AVAILABLE = True
 try:
-    from skimage.filters import threshold_sauvola
-    SKIMAGE_AVAILABLE = True
+    import tensorflow as tf
+    from tensorflow.keras import layers, models, optimizers
 except Exception:
-    SKIMAGE_AVAILABLE = False
+    TF_AVAILABLE = False
 
-try:
-    from scipy.spatial import cKDTree
-    SCIPY_AVAILABLE = True
-except Exception:
-    SCIPY_AVAILABLE = False
+# Utilities
+def ensure_dir(d):
+    os.makedirs(d, exist_ok=True)
 
-st.set_page_config(page_title="Iterative Kern-Zählung (OD + Deconv) — v3", layout="wide")
-st.title("🧬 Iterative Kern-Zählung — V.3 (robust & faster)")
+# ----- Model definition (Small U-Net, M-size) -----
+def build_unet(input_shape=(256,256,1), base_filters=32, depth=4):
+    inputs = layers.Input(shape=input_shape)
+    x = inputs
+    skips = []
+    # Encoder
+    for d in range(depth):
+        f = base_filters * (2**d)
+        x = layers.Conv2D(f, 3, padding='same', activation='relu')(x)
+        x = layers.Conv2D(f, 3, padding='same', activation='relu')(x)
+        skips.append(x)
+        x = layers.MaxPooling2D(2)(x)
+    # Bottleneck
+    f = base_filters * (2**depth)
+    x = layers.Conv2D(f, 3, padding='same', activation='relu')(x)
+    x = layers.Conv2D(f, 3, padding='same', activation='relu')(x)
+    # Decoder
+    for d in reversed(range(depth)):
+        f = base_filters * (2**d)
+        x = layers.UpSampling2D(2)(x)
+        x = layers.Concatenate()([x, skips[d]])
+        x = layers.Conv2D(f, 3, padding='same', activation='relu')(x)
+        x = layers.Conv2D(f, 3, padding='same', activation='relu')(x)
+    outputs = layers.Conv2D(1, 1, activation='sigmoid')(x)
+    model = models.Model(inputs, outputs)
+    return model
 
-# -------------------- Utilities --------------------
-def is_near(p1, p2, r=6.0):
-    return np.linalg.norm(np.array(p1, dtype=float) - np.array(p2, dtype=float)) < float(r)
+# ----- Image utilities: tiling, normalization, calibration -----
 
-
-def dedup_new_points_kdtree(candidates, existing, min_dist=6.0):
-    """Return list of candidates that are at least min_dist away from any existing point.
-    Uses cKDTree when available; otherwise falls back to a fast numpy windowed method.
-    Points are (x,y) tuples.
-    """
-    if not candidates:
-        return []
-    cand = np.array(candidates, dtype=float)
-    if existing and SCIPY_AVAILABLE:
-        tree = cKDTree(np.array(existing, dtype=float))
-        dists, _ = tree.query(cand, k=1, workers=-1)
-        mask = dists >= min_dist
-        return [tuple(map(int, map(round, p))) for p in cand[mask]]
-    elif not existing:
-        return [tuple(map(int, map(round, p))) for p in cand]
-    else:
-        # fallback: sort by x and check window (O(n log n) + local checks)
-        ex = np.array(existing, dtype=float)
-        ex_sorted_idx = np.argsort(ex[:, 0])
-        ex_sorted = ex[ex_sorted_idx]
-        out = []
-        # helper to check if candidate is near any existing via small window
-        for p in cand:
-            x = p[0]
-            # binary search window in ex_sorted where x difference < min_dist
-            lo = np.searchsorted(ex_sorted[:, 0], x - min_dist, side='left')
-            hi = np.searchsorted(ex_sorted[:, 0], x + min_dist, side='right')
-            neigh = ex_sorted[lo:hi]
-            if neigh.size == 0:
-                out.append((int(round(p[0])), int(round(p[1]))))
-            else:
-                if np.all(np.linalg.norm(neigh - p, axis=1) >= min_dist):
-                    out.append((int(round(p[0])), int(round(p[1]))))
-        return out
+def reinhard_normalize(src, target_mean=0.5, eps=1e-8):
+    """Simple intensity normalization to a target mean (per-image)."""
+    arr = src.astype(np.float32) / 255.0
+    mean = arr.mean()
+    scale = (target_mean + eps) / (mean + eps)
+    dst = np.clip(arr * scale, 0.0, 1.0)
+    return (dst * 255.0).astype(np.uint8)
 
 
-def extract_patch(img, x, y, radius=5):
-    y_min = max(0, int(y - radius))
-    y_max = min(img.shape[0], int(y + radius + 1))
-    x_min = max(0, int(x - radius))
-    x_max = min(img.shape[1], int(x + radius + 1))
-    if y_min >= y_max or x_min >= x_max:
-        return None
-    return img[y_min:y_max, x_min:x_max]
-
-
-def median_od_vector_from_patch(patch, top_pct=0.35, eps=1e-6):
-    """Compute a robust OD vector from a small RGB patch.
-    Strategy: compute OD per pixel, compute OD-norm per pixel, take top percentile
-    (strongest absorbing pixels) and compute median across them.
-    Returns normalized 3-vector (float32) or None on failure.
-    """
-    if patch is None or patch.size == 0:
-        return None
-    patch = patch.astype(np.float32)
-    # compute OD
-    with np.errstate(divide='ignore', invalid='ignore'):
-        OD = -np.log(np.clip((patch + eps) / 255.0, 1e-8, 1.0))
-    norms = np.linalg.norm(OD.reshape(-1, 3), axis=1)
-    if np.all(np.isfinite(norms) == False) or np.nanmax(norms) <= 1e-8:
-        return None
-    # pick top_pct of pixels by OD norm
-    k = max(1, int(len(norms) * float(top_pct)))
-    idx = np.argpartition(-norms, k - 1)[:k]
-    vec = np.median(OD.reshape(-1, 3)[idx, :], axis=0)
-    if not np.all(np.isfinite(vec)):
-        return None
-    n = np.linalg.norm(vec)
-    if n <= 1e-8:
-        return None
-    return (vec / n).astype(np.float32)
-
-
-def normalize_vector(v):
-    v = np.array(v, dtype=float)
-    n = np.linalg.norm(v)
-    if n <= 1e-12:
-        return v.astype(float)
-    return (v / n).astype(float)
-
-
-def make_stain_matrix(target_vec, hema_vec, bg_vec=None):
-    """Create numerically stable 3x3 stain matrix.
-    - target_vec, hema_vec: 3-element iterables
-    - if bg_vec None, compute orthogonal via SVD/Gram-Schmidt
-    Returns 3x3 float32 matrix with small regularization.
-    """
-    t = normalize_vector(target_vec)
-    h = normalize_vector(hema_vec)
-
-    # if t and h almost collinear, perturb h slightly
-    if abs(np.dot(t, h)) > 0.995:
-        # small orthogonal perturbation
-        h = normalize_vector(h + 1e-2 * np.array([0.1, -0.07, 0.05]))
-
-    if bg_vec is None:
-        # stack and perform SVD to get orthogonal basis
-        try:
-            A = np.column_stack([t, h])
-            U, S, Vt = np.linalg.svd(A, full_matrices=True)
-            # pick third column of U as orthogonal complement
-            if U.shape[1] >= 3:
-                bg = U[:, 2]
-            else:
-                # fallback to Gram-Schmidt
-                proj = np.dot(t, h) * t
-                orth = h - proj
-                if np.linalg.norm(orth) < 1e-6:
-                    # final fallback: cross-product
-                    bg = np.cross(t, h)
-                else:
-                    bg = orth
-        except Exception:
-            bg = np.cross(t, h)
-            if np.linalg.norm(bg) < 1e-6:
-                # tiny perturbation fallback
-                if abs(t[0]) > 0.1 or abs(t[1]) > 0.1:
-                    bg = np.array([t[1], -t[0], 0.0], dtype=float)
-                else:
-                    bg = np.array([0.0, t[2], -t[1]], dtype=float)
-    else:
-        bg = normalize_vector(bg_vec)
-
-    bg = normalize_vector(bg)
-    M = np.column_stack([t, h, bg]).astype(np.float32)
-    M = M + np.eye(3, dtype=np.float32) * 1e-8
-    return M
-
-
-# Precompute log LUT for speed (0..255)
-_LOG_LUT = -np.log((np.arange(256).astype(np.float32) + 1e-6) / 255.0)
-
-
-def deconvolve(img_rgb, M):
-    """Fast deconvolution using precomputed LUT. Returns C of shape (H,W,3) float32.
-    Expects img_rgb uint8 RGB.
-    """
-    if img_rgb.dtype != np.uint8:
-        img = img_rgb.astype(np.uint8)
-    else:
-        img = img_rgb
+def image_to_patches(img: np.ndarray, patch_size:int, overlap:int) -> Tuple[List[np.ndarray], List[Tuple[int,int]]]:
     H, W = img.shape[:2]
-    # use LUT per channel then stack
-    img_r = _LOG_LUT[img[:, :, 0]]
-    img_g = _LOG_LUT[img[:, :, 1]]
-    img_b = _LOG_LUT[img[:, :, 2]]
-    OD = np.stack([img_r, img_g, img_b], axis=2).reshape(-1, 3)  # N x 3
+    stride = patch_size - overlap
+    patches = []
+    coords = []
+    for y in range(0, H, stride):
+        if y + patch_size > H:
+            y = max(0, H - patch_size)
+        for x in range(0, W, stride):
+            if x + patch_size > W:
+                x = max(0, W - patch_size)
+            patch = img[y:y+patch_size, x:x+patch_size]
+            if patch.shape[0] != patch_size or patch.shape[1] != patch_size:
+                # pad
+                pad = np.zeros((patch_size, patch_size, img.shape[2]), dtype=img.dtype)
+                pad[:patch.shape[0], :patch.shape[1]] = patch
+                patch = pad
+            patches.append(patch)
+            coords.append((x,y))
+        # break if last block reached
+        if y + patch_size >= H:
+            break
+    return patches, coords
+
+
+def patches_to_image(pred_patches: List[np.ndarray], coords: List[Tuple[int,int]], out_shape: Tuple[int,int], patch_size:int, overlap:int):
+    H, W = out_shape
+    heat = np.zeros((H, W), dtype=np.float32)
+    weight = np.zeros((H, W), dtype=np.float32)
+    for p, (x,y) in zip(pred_patches, coords):
+        h = min(patch_size, H - y)
+        w = min(patch_size, W - x)
+        heat[y:y+h, x:x+w] += p[:h,:w]
+        weight[y:y+h, x:x+w] += 1.0
+    weight[weight==0] = 1.0
+    heat /= weight
+    return heat
+
+# ----- Postprocessing: thresholding, small object removal, center extraction -----
+
+def auto_threshold(prob_map: np.ndarray) -> float:
+    # Otsu threshold on probability map scaled to 0..255
+    u8 = np.clip((prob_map * 255.0).astype(np.uint8), 0, 255)
     try:
-        pinv = np.linalg.pinv(M)
-        C = (pinv @ OD.T).T
+        _, thr = cv2.threshold(u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return thr / 255.0
     except Exception:
-        return None
-    return C.reshape(H, W, 3).astype(np.float32)
+        return 0.5
 
 
-def detect_centers_from_channel(channel, min_area=8, downsample=4, sauvola_window=35, sauvola_k=0.2):
-    """Robuste Erkennung basierend auf einem real-valued channel (float);
-    - downsample: compute mask at reduced resolution to speed up processing
-    - returns list of centers in original coordinates and mask (resized to original)
-    """
-    arr = np.array(channel, dtype=np.float32)
-    arr = np.maximum(arr, 0.0)
-    H, W = arr.shape
-    if H < 1 or W < 1:
-        return [], np.zeros_like(arr, dtype=np.uint8)
+def postprocess_mask(prob_map: np.ndarray, thr: float=None, min_area:int=5) -> np.ndarray:
+    if thr is None:
+        thr = auto_threshold(prob_map)
+    mask = (prob_map >= thr).astype(np.uint8)
+    # remove small objects
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    out_mask = np.zeros_like(mask)
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            out_mask[labels==i] = 1
+    return out_mask
 
-    # robust normalization
-    vmin, vmax = np.percentile(arr, [2, 99.5])
-    if vmax - vmin < 1e-6:
-        return [], np.zeros_like(arr, dtype=np.uint8)
-    norm = np.clip((arr - vmin) / (vmax - vmin), 0.0, 1.0)
 
-    # downsample for mask creation
-    ds = max(1, int(downsample))
-    small = cv2.resize((norm * 255.0).astype(np.uint8), (W // ds, H // ds), interpolation=cv2.INTER_AREA)
-
-    # thresholding: prefer Sauvola if available
-    if SKIMAGE_AVAILABLE and min(small.shape) >= 16:
-        try:
-            small_float = small.astype(np.float32) / 255.0
-            thresh = threshold_sauvola(small_float, window_size=min(sauvola_window, min(small.shape) - 1), k=sauvola_k)
-            mask_small = (small_float > thresh).astype(np.uint8) * 255
-        except Exception:
-            _, mask_small = cv2.threshold(small, int(0.5 * 255), 255, cv2.THRESH_BINARY)
-    else:
-        # fallback: adaptiveThreshold with blockSize proportional to small image
-        bsize = max(3, (min(small.shape) // 20) | 1)  # odd
-        C = 2
-        try:
-            mask_small = cv2.adaptiveThreshold(small, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                               cv2.THRESH_BINARY, bsize, C)
-        except Exception:
-            _, mask_small = cv2.threshold(small, int(0.5 * 255), 255, cv2.THRESH_BINARY)
-
-    # small morphological cleanups on small mask
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-    mask_small = cv2.morphologyEx(mask_small, cv2.MORPH_OPEN, kernel)
-    mask_small = cv2.morphologyEx(mask_small, cv2.MORPH_CLOSE, kernel)
-
-    # upscale to original size for contour detection
-    mask_up = cv2.resize(mask_small, (W, H), interpolation=cv2.INTER_NEAREST)
-
-    # find contours at full resolution
-    contours, _ = cv2.findContours(mask_up, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+def extract_centers_from_mask(mask: np.ndarray, min_area=5) -> List[Tuple[int,int]]:
+    contours, _ = cv2.findContours((mask*255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     centers = []
     for c in contours:
         area = cv2.contourArea(c)
         if area >= max(1, min_area):
             M = cv2.moments(c)
             if M.get('m00', 0) != 0:
-                cx = float(M['m10'] / M['m00'])
-                cy = float(M['m01'] / M['m00'])
-                centers.append((int(round(cx)), int(round(cy))))
-    return centers, mask_up
+                cx = int(round(M['m10']/M['m00']))
+                cy = int(round(M['m01']/M['m00']))
+                centers.append((cx, cy))
+    return centers
 
+# ----- Streamlit App -----
+st.set_page_config(page_title="CNN Nuclei Detector — v3 (U-Net)", layout='wide')
+st.title("🧠 CNN-based Nuclei Detection — U-Net (v3)")
 
-# -------------------- SessionState initialisierung --------------------
-for k in [
-    "groups",
-    "all_points",
-    "last_file",
-    "disp_width",
-    "C_cache",
-    "last_M_hash",
-    "history",
-    "params_hash",
-]:
+# Sidebar: model & data
+with st.sidebar:
+    st.header("Model & Data")
+    model_variant = st.selectbox("U-Net base filters", [16, 32, 48], index=1, help="Base number of filters. Larger = better quality but slower.")
+    input_patch = st.selectbox("Model input patch (px)", [128, 192, 256, 320], index=2)
+    overlap = st.selectbox("Tile overlap (px)", [16, 32, 48, 64], index=1)
+    min_area = st.number_input("Min component area (px)", min_value=1, max_value=500, value=8)
+    train_epochs = st.number_input("Train epochs", min_value=1, max_value=200, value=25)
+    batch_size = st.number_input("Train batch size", min_value=1, max_value=32, value=8)
+
+st.sidebar.markdown("---")
+with st.sidebar.expander("Advanced intelligent features"):
+    auto_scaling = st.checkbox("Auto-Scaling (tile size adapt to image)", value=True)
+    auto_post = st.checkbox("Auto-Postprocessing (small-object removal)", value=True)
+    auto_calib = st.checkbox("Auto-Calibration (simple intensity norm)", value=True)
+    auto_thresh = st.checkbox("Auto-Threshold (Otsu)", value=True)
+
+# Model load / build
+MODEL_PATH = "model_unet_v3.h5"
+model = None
+if TF_AVAILABLE:
+    if os.path.exists(MODEL_PATH):
+        try:
+            model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+            st.sidebar.success(f"Model geladen: {MODEL_PATH}")
+        except Exception as e:
+            st.sidebar.warning(f"Fehler beim Laden des Modells: {e}. Neu bauen.")
+            model = build_unet(input_shape=(input_patch, input_patch, 1), base_filters=model_variant, depth=4)
+    else:
+        model = build_unet(input_shape=(input_patch, input_patch, 1), base_filters=model_variant, depth=4)
+else:
+    st.sidebar.error("TensorFlow nicht installiert. Installiere tensorflow, um Training/Inferenz zu nutzen.")
+
+# Data upload for training
+st.markdown("## 1) Dataset (Train/Fine-tune)")
+st.info("Upload pairs of images + masks. Masks should be binary images with same filename + suffix '_mask' or uploaded in the same order.")
+col_u1, col_u2 = st.columns(2)
+with col_u1:
+    imgs = st.file_uploader("Upload input images (multiple)", type=["png","jpg","tif","tiff"], accept_multiple_files=True)
+with col_u2:
+    masks = st.file_uploader("Upload masks (binary) (multiple)", type=["png","jpg","tif","tiff"], accept_multiple_files=True)
+
+train_btn = st.button("Start Training / Fine-tune")
+
+# Inference area
+st.markdown("## 2) Inference & Manual Correction")
+uploaded = st.file_uploader("Upload image for inference (single)", type=["png","jpg","tif","tiff"]) 
+
+# Session state for UI interactions
+for k in ["train_data", "pred_cache", "manual_points", "history", "last_infer_file"]:
     if k not in st.session_state:
-        if k in ["groups", "all_points", "history"]:
+        if k in ["train_data", "manual_points", "history"]:
             st.session_state[k] = []
-        elif k == "disp_width":
-            st.session_state[k] = 1000
         else:
             st.session_state[k] = None
 
-# -------------------- UI: Upload + Parameter --------------------
-uploaded_file = st.file_uploader("Bild hochladen (jpg/png/tif)", type=["jpg", "png", "tif", "tiff"])
-if not uploaded_file:
-    st.info("Bitte zuerst ein Bild hochladen.")
-    st.stop()
-
-# reset on new file
-if uploaded_file.name != st.session_state.last_file:
-    st.session_state.groups = []
-    st.session_state.all_points = []
-    st.session_state.C_cache = None
-    st.session_state.last_M_hash = None
-    st.session_state.history = []
-    st.session_state.last_file = uploaded_file.name
-
-col1, col2 = st.columns([2, 1])
-with col2:
-    st.sidebar.markdown("### Parameter")
-    calib_radius = st.sidebar.slider("Kalibrier-Radius (px, original image)", 1, 60, 6)
-    detection_threshold = st.sidebar.slider("Threshold (nur Info, 0-1)", 0.01, 0.9, 0.2, 0.01)
-    min_area_display = st.sidebar.number_input("Min. Konturfläche (px) — angezeigt (Display-Äquivalent)", min_value=1, max_value=2000, value=80)
-    dedup_dist_display = st.sidebar.slider("Min. Distanz für Doppelzählung (px, Display)", 1, 80, 12)
-    circle_radius = st.sidebar.slider("Marker-Radius (px, Display)", 1, 14, 6)
-    downsample_mask = st.sidebar.select_slider("Mask Downsample-Faktor", options=[1,2,4,8], value=4)
-    st.sidebar.markdown("### Startvektoren (optional, RGB)")
-    hema_default = st.sidebar.text_input("Hematoxylin vector (comma)", value="0.65,0.70,0.29")
-    aec_default = st.sidebar.text_input("Chromogen (e.g. AEC/DAB) vector (comma)", value="0.27,0.57,0.78")
-
-    # parse start vectors
-    try:
-        hema_vec0 = np.array([float(x.strip()) for x in hema_default.split(",")], dtype=float)
-        aec_vec0 = np.array([float(x.strip()) for x in aec_default.split(",")], dtype=float)
-    except Exception:
-        hema_vec0 = np.array([0.65, 0.70, 0.29], dtype=float)
-        aec_vec0 = np.array([0.27, 0.57, 0.78], dtype=float)
-
-with col1:
-    DISPLAY_WIDTH = st.slider("Anzeige-Breite (px)", 300, 1600, st.session_state.disp_width)
-    st.session_state.disp_width = DISPLAY_WIDTH
-
-# -------------------- Prepare images --------------------
-image_orig = np.array(Image.open(uploaded_file).convert("RGB"))
-H_orig, W_orig = image_orig.shape[:2]
-scale = DISPLAY_WIDTH / float(W_orig)
-H_disp = int(round(H_orig * scale))
-image_disp = cv2.resize(image_orig, (DISPLAY_WIDTH, H_disp), interpolation=cv2.INTER_AREA)
-
-# convert units
-area_scale = (1.0 / (scale * scale)) if scale > 0 else 1.0
-min_area_orig = max(1, int(round(min_area_display * area_scale)))
-dedup_dist_orig = max(1.0, float(dedup_dist_display / scale))
-
-# draw existing points
-display_canvas = image_disp.copy()
-PRESET_COLORS = [
-    (220, 20, 60),    # crimson
-    (0, 128, 0),      # green
-    (30, 144, 255),   # dodger
-    (255, 165, 0),    # orange
-    (148, 0, 211),    # purple
-    (0, 255, 255),    # cyan
-]
-for i, g in enumerate(st.session_state.groups):
-    col = tuple(int(x) for x in g.get("color", PRESET_COLORS[i % len(PRESET_COLORS)]))
-    for (x_orig, y_orig) in g["points"]:
-        x_disp = int(round(x_orig * scale))
-        y_disp = int(round(y_orig * scale))
-        cv2.circle(display_canvas, (x_disp, y_disp), circle_radius, col, -1)
-    if g["points"]:
-        px_disp = int(round(g["points"][0][0] * scale))
-        py_disp = int(round(g["points"][0][1] * scale))
-        cv2.putText(display_canvas, f"G{i+1}:{len(g['points'])}", (px_disp + 6, py_disp - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
-
-from streamlit_image_coordinates import streamlit_image_coordinates
-coords = streamlit_image_coordinates(Image.fromarray(display_canvas),
-                                    key=f"clickable_image_v3_{st.session_state.last_file}",
-                                    width=DISPLAY_WIDTH)
-
-# Sidebar actions
-mode = st.sidebar.radio("Aktion", ["Kalibriere und zähle Gruppe (Klick)", "Punkt löschen", "Undo letzte Aktion"]) 
-st.sidebar.markdown("---")
-if st.sidebar.button("Reset (Alle Gruppen)"):
-    st.session_state.history.append(("reset", {
-        "groups": json.loads(json.dumps(st.session_state.groups)),
-        "all_points": list(st.session_state.all_points)
-    }))
-    st.session_state.groups = []
-    st.session_state.all_points = []
-    st.session_state.C_cache = None
-    st.session_state.last_M_hash = None
-    st.success("Zurückgesetzt.")
-
-# -------------------- Click handling --------------------
-if coords:
-    x_disp, y_disp = int(coords["x"]), int(coords["y"])
-    x_orig = int(round(x_disp / scale))
-    y_orig = int(round(y_disp / scale))
-
-    if mode == "Punkt löschen":
-        removed = []
-        new_all = []
-        # build groups mapping for history
-        removed_map = []  # list of (group_idx, point)
-        for gi, g in enumerate(st.session_state.groups):
-            kept = []
-            for p in g["points"]:
-                if is_near(p, (x_orig, y_orig), dedup_dist_orig):
-                    removed.append(p)
-                    removed_map.append({"group_idx": gi, "point": p})
-                else:
-                    kept.append(p)
-            g["points"] = kept
-        for p in st.session_state.all_points:
-            if not is_near(p, (x_orig, y_orig), dedup_dist_orig):
-                new_all.append(p)
-        if removed:
-            st.session_state.history.append(("delete_points", {"removed_map": removed_map}))
-            st.session_state.all_points = new_all
-            st.success(f"{len(removed)} Punkt(e) gelöscht.")
-        else:
-            st.info("Kein Punkt in der Nähe gefunden.")
-
-    elif mode == "Undo letzte Aktion":
-        if st.session_state.history:
-            action, payload = st.session_state.history.pop()
-            if action == "add_group":
-                idx = payload["group_idx"]
-                if 0 <= idx < len(st.session_state.groups):
-                    grp = st.session_state.groups.pop(idx)
-                    for pt in grp["points"]:
-                        # remove one instance from all_points
-                        if pt in st.session_state.all_points:
-                            st.session_state.all_points.remove(pt)
-                    st.success("Letzte Gruppen-Aktion rückgängig gemacht.")
-                else:
-                    st.warning("Letzte Aktion konnte nicht rückgängig gemacht werden.")
-            elif action == "delete_points":
-                removed_map = payload.get("removed_map", [])
-                # restore points into their original groups
-                # ensure groups exist (they should), otherwise append
-                for item in removed_map:
-                    gi = item["group_idx"]
-                    pt = tuple(item["point"]) if isinstance(item["point"], list) else item["point"]
-                    if 0 <= gi < len(st.session_state.groups):
-                        st.session_state.groups[gi]["points"].append(pt)
-                    else:
-                        st.session_state.groups.append({"vec": None, "points": [pt], "color": PRESET_COLORS[len(st.session_state.groups) % len(PRESET_COLORS)]})
-                    st.session_state.all_points.append(pt)
-                st.success("Gelöschte Punkte wiederhergestellt.")
-            elif action == "reset":
-                st.session_state.groups = payload["groups"]
-                st.session_state.all_points = payload["all_points"]
-                st.success("Reset rückgängig gemacht.")
-            else:
-                st.warning("Undo: unbekannte Aktion.")
-        else:
-            st.info("Keine Aktion zum Rückgängig machen.")
-
+# ----- Training pipeline (simple) -----
+if train_btn:
+    if not TF_AVAILABLE:
+        st.error("TensorFlow nicht verfügbar — Training nicht möglich.")
     else:
-        # Mode: Kalibriere und zähle Gruppe
-        patch = extract_patch(image_orig, x_orig, y_orig, calib_radius)
-        vec = median_od_vector_from_patch(patch)
-        if vec is None:
-            st.warning("Patch unbrauchbar (zu homogen oder außerhalb). Bitte anders klicken.")
+        # Basic validation: require equal number of images and masks
+        if not imgs or not masks or len(imgs) != len(masks):
+            st.error("Bitte gleiche Anzahl von Bildern und Masken hochladen (oder paired filenames).")
         else:
-            M = make_stain_matrix(vec, hema_vec0)
-            M_hash = tuple(np.round(M.flatten(), 6).tolist())
+            # load all into memory (careful with many large files)
+            X = []
+            Y = []
+            with st.spinner("Lade Trainingsdaten..."):
+                for f_img, f_mask in zip(imgs, masks):
+                    im = Image.open(f_img).convert('RGB')
+                    mk = Image.open(f_mask).convert('L')
+                    im_a = np.array(im)
+                    mk_a = np.array(mk)
+                    # auto-calibration
+                    if auto_calib:
+                        im_a = reinhard_normalize(im_a)
+                    # convert mask to binary
+                    mk_bin = (mk_a > 127).astype(np.uint8)
+                    # tile or resize to input_patch
+                    im_res = cv2.resize(cv2.cvtColor(im_a, cv2.COLOR_RGB2GRAY), (input_patch, input_patch), interpolation=cv2.INTER_AREA)
+                    mk_res = cv2.resize(mk_bin, (input_patch, input_patch), interpolation=cv2.INTER_NEAREST)
+                    X.append(im_res[..., None].astype(np.float32) / 255.0)
+                    Y.append(mk_res[..., None].astype(np.float32))
+            X = np.stack(X, axis=0)
+            Y = np.stack(Y, axis=0)
+            st.write(f"Trainingssamples: {X.shape[0]} | Patch size: {input_patch}")
 
-            recompute = False
-            # also track mask downsample param & image name to decide cache
-            params_hash = (st.session_state.last_file, M_hash, downsample_mask)
-            if st.session_state.C_cache is None or st.session_state.last_M_hash != M_hash or st.session_state.params_hash != params_hash:
-                recompute = True
-            if recompute:
-                C_full = deconvolve(image_orig, M)
-                if C_full is None:
-                    st.error("Deconvolution fehlgeschlagen (numerisch).")
-                    st.stop()
-                st.session_state.C_cache = C_full
-                st.session_state.last_M_hash = M_hash
-                st.session_state.params_hash = params_hash
-            else:
-                C_full = st.session_state.C_cache
+            # compile model with dice+binary crossentropy
+            def dice_loss(y_true, y_pred, smooth=1e-6):
+                y_true_f = tf.reshape(y_true, [-1])
+                y_pred_f = tf.reshape(y_pred, [-1])
+                intersection = tf.reduce_sum(y_true_f * y_pred_f)
+                return 1 - (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
 
-            channel_full = C_full[:, :, 0]
+            def combined_loss(y_true, y_pred):
+                bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
+                d = dice_loss(y_true, y_pred)
+                return bce + d
 
-            centers_orig, mask = detect_centers_from_channel(channel_full, min_area=min_area_orig, downsample=downsample_mask)
+            model.compile(optimizer=optimizers.Adam(1e-4), loss=combined_loss, metrics=["accuracy"]) 
+            with st.spinner("Training läuft — das kann einige Minuten dauern..."):
+                history = model.fit(X, Y, epochs=int(train_epochs), batch_size=int(batch_size), validation_split=0.1)
+            # save model
+            model.save(MODEL_PATH)
+            st.success("Training abgeschlossen — Modell gespeichert.")
 
-            new_centers = dedup_new_points_kdtree(centers_orig, st.session_state.all_points, min_dist=dedup_dist_orig)
+# ----- Inference pipeline -----
+if uploaded:
+    img = np.array(Image.open(uploaded).convert('RGB'))
+    H, W = img.shape[:2]
+    st.write(f"Bild geladen: {uploaded.name} — Größe: {W}x{H}")
 
-            if new_centers:
-                color = PRESET_COLORS[len(st.session_state.groups) % len(PRESET_COLORS)]
-                group = {"vec": vec.tolist(), "points": new_centers, "color": color}
-                st.session_state.history.append(("add_group", {"group_idx": len(st.session_state.groups)}))
-                st.session_state.groups.append(group)
-                st.session_state.all_points.extend(new_centers)
-                st.success(f"Gruppe hinzugefügt — neue Kerne: {len(new_centers)}")
-            else:
-                st.info("Keine neuen Kerne (alle bereits gezählt oder keine Detektion).")
+    # auto-calibration
+    if auto_calib:
+        img_proc = reinhard_normalize(img)
+    else:
+        img_proc = img.copy()
 
-# -------------------- Ergebnisse & Export --------------------
-st.markdown("## Ergebnisse")
-colA, colB = st.columns([2, 1])
-with colA:
-    st.image(display_canvas, caption="Gezählte Kerne (Gruppenfarben)", use_column_width=True)
+    # auto-scaling: choose patch_size based on image if enabled
+    patch_size = input_patch
+    if auto_scaling:
+        # heuristic: reduce patch_size for small images, increase for big
+        max_dim = max(H, W)
+        if max_dim > 3000:
+            patch_size = min(512, input_patch + 128)
+        elif max_dim < 800:
+            patch_size = max(128, input_patch - 64)
 
-with colB:
-    st.markdown("### Zusammenfassung")
-    st.write(f"🔹 Gruppen gesamt: {len(st.session_state.groups)}")
-    for i, g in enumerate(st.session_state.groups):
-        st.write(f"• Gruppe {i+1}: {len(g['points'])} neue Kerne")
-    st.markdown(f"**Gesamt (unique Kerne): {len(st.session_state.all_points)}**")
+    # prepare patches
+    patches, coords = image_to_patches(cv2.cvtColor(img_proc, cv2.COLOR_RGB2GRAY)[...,None], patch_size, overlap)
+    # normalize patches
+    Xp = np.stack([p.astype(np.float32)/255.0 for p in patches], axis=0)
 
-    if st.button("Speichere Maske (letzte Deconv-Channel)"):
-        if st.session_state.C_cache is not None:
-            channel_to_save = st.session_state.C_cache[:, :, 0]
-            vmin, vmax = np.percentile(channel_to_save, [2, 99.5])
-            norm = np.clip((channel_to_save - vmin) / max(1e-8, (vmax - vmin)), 0.0, 1.0)
-            u8 = (norm * 255).astype(np.uint8)
-            u8_disp = cv2.resize(u8, (DISPLAY_WIDTH, H_disp), interpolation=cv2.INTER_AREA)
-            pil = Image.fromarray(u8_disp)
-            buf = st.session_state.last_file + "_channel_v3.png"
-            pil.save(buf)
-            with open(buf, "rb") as f:
-                st.download_button("📥 Download Channel (PNG)", f.read(), file_name=buf, mime="image/png")
+    # batch predict
+    preds = []
+    if TF_AVAILABLE and model is not None:
+        B = 8
+        for i in range(0, len(Xp), B):
+            batch = Xp[i:i+B]
+            pred = model.predict(batch)
+            preds.extend([p[...,0] for p in pred])
+    else:
+        st.error("TensorFlow/Model nicht verfügbar — Inferenz nicht möglich.")
+        preds = [np.zeros((patch_size, patch_size), dtype=np.float32) for _ in patches]
+
+    # reconstruct full probability map
+    prob_map = patches_to_image(preds, coords, (H, W), patch_size, overlap)
+
+    # threshold and postprocess
+    thr = None
+    if auto_thresh:
+        thr = auto_threshold(prob_map)
+    else:
+        thr = 0.5
+    mask = postprocess_mask(prob_map, thr=thr, min_area=int(min_area if auto_post else 1))
+    centers = extract_centers_from_mask(mask, min_area=int(min_area if auto_post else 1))
+
+    # cache prediction for manual correction
+    st.session_state.pred_cache = {
+        'file': uploaded.name,
+        'prob_map': prob_map.tolist(),
+        'mask': mask.tolist(),
+        'centers': centers
+    }
+    st.session_state.last_infer_file = uploaded.name
+
+    # display overlay & interactive correction
+    display_width = st.slider("Anzeige-Breite (px)", 300, 1600, 1000)
+    scale = display_width / float(W)
+    H_disp = int(round(H * scale))
+    img_disp = cv2.resize(img, (display_width, H_disp), interpolation=cv2.INTER_AREA)
+    overlay = img_disp.copy()
+    # draw centers
+    for (x,y) in centers:
+        x_d = int(round(x * scale)); y_d = int(round(y * scale))
+        cv2.circle(overlay, (x_d, y_d), 6, (0,255,0), -1)
+    # clickable image
+    from streamlit_image_coordinates import streamlit_image_coordinates
+    coords_click = streamlit_image_coordinates(Image.fromarray(overlay), key=f"cnn_infer_{uploaded.name}", width=display_width)
+
+    st.markdown("### Ergebnisse")
+    colA, colB = st.columns([2,1])
+    with colA:
+        st.image(overlay, caption="Prediction overlay (click to add/delete)", use_column_width=True)
+    with colB:
+        st.write(f"Detected centers: {len(centers)}")
+        st.write(f"Auto-threshold: {thr:.3f}")
+        if st.button("Export CSV (centers)"):
+            rows = []
+            for (x,y) in centers:
+                rows.append({"X_original": int(x), "Y_original": int(y)})
+            df = pd.DataFrame(rows)
+            st.download_button("Download CSV", df.to_csv(index=False).encode('utf-8'), file_name='cnn_centers.csv', mime='text/csv')
+
+    # manual correction handling
+    if coords_click:
+        x_d = int(coords_click['x']); y_d = int(coords_click['y'])
+        x_o = int(round(x_d / scale)); y_o = int(round(y_d / scale))
+        # toggle: if near existing -> delete, else add
+        found = None
+        for c in centers:
+            if math.hypot(c[0]-x_o, c[1]-y_o) <= 8:
+                found = c
+                break
+        if found:
+            centers.remove(found)
+            st.session_state.history.append(('delete_point', {'point': found}))
+            st.success('Punkt gelöscht')
         else:
-            st.info("Keine Deconvolution im Cache verfügbar.")
+            centers.append((x_o, y_o))
+            st.session_state.history.append(('add_point', {'point': (x_o,y_o)}))
+            st.success('Punkt hinzugefügt')
+        # update cache and redisplay
+        st.session_state.pred_cache['centers'] = centers
+        # redraw overlay
+        overlay2 = img_disp.copy()
+        for (x,y) in centers:
+            cv2.circle(overlay2, (int(round(x*scale)), int(round(y*scale))), 6, (0,255,0), -1)
+        st.image(overlay2, caption='Updated overlay', use_column_width=True)
 
-# CSV Export
-if st.session_state.all_points:
-    rows = []
-    for i, g in enumerate(st.session_state.groups):
-        for (x_orig, y_orig) in g["points"]:
-            x_disp = int(round(x_orig * scale))
-            y_disp = int(round(y_orig * scale))
-            rows.append({"Group": i + 1, "X_display": int(x_disp), "Y_display": int(y_disp),
-                         "X_original": int(x_orig), "Y_original": int(y_orig)})
-    df = pd.DataFrame(rows)
-    st.download_button("📥 CSV exportieren (Gruppen, inkl. Original-Koords)", df.to_csv(index=False).encode("utf-8"),
-                       file_name="kern_gruppen_v3.csv", mime="text/csv")
+# Undo button
+if st.button('Undo letzte Aktion'):
+    if st.session_state.history:
+        action, payload = st.session_state.history.pop()
+        if action == 'delete_point':
+            p = tuple(payload['point'])
+            st.session_state.pred_cache['centers'].append(p)
+            st.success('Undo: Punkt wiederhergestellt')
+        elif action == 'add_point':
+            p = tuple(payload['point'])
+            st.session_state.pred_cache['centers'] = [c for c in st.session_state.pred_cache['centers'] if c != p]
+            st.success('Undo: hinzugefügter Punkt entfernt')
+    else:
+        st.info('Keine Aktion zum Rückgängig machen')
 
-    df_unique = pd.DataFrame(st.session_state.all_points, columns=["X_original", "Y_original"])
-    df_unique["X_display"] = (df_unique["X_original"] * scale).round().astype(int)
-    df_unique["Y_display"] = (df_unique["Y_original"] * scale).round().astype(int)
-    st.download_button("📥 CSV exportieren (unique Gesamt)", df_unique.to_csv(index=False).encode("utf-8"),
-                       file_name="kern_unique_v3.csv", mime="text/csv")
-
-st.markdown("---")
-st.caption("Hinweise: Deconvolution wird auf dem ORIGINALbild ausgeführt. V3 verwendet eine robuste OD-Schätzung, mask-downsampling und KDTree-basierte Dedup. Wenn skimage/scipy fehlen, laufen Fallback-Algorithmen.")
+st.markdown('---')
+st.caption('Hinweis: Diese Version führt die komplette Kern-Erkennung via CNN durch (U-Net). Wenn du möchtest, kann ich jetzt noch: 1) performance-optimieren (GPU-Batching, mixed precision), 2) Tile-Visualizer, 3) Auto-finetune-on-corrections.')
