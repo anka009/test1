@@ -1,14 +1,16 @@
-# canvas_iterative_cnn_v3.py
+# canvas_iterative_cnn_v3_auto.py
 import streamlit as st
 import numpy as np
 import cv2
 from PIL import Image
 import pandas as pd
 from tensorflow.keras import layers, models
+from skimage.morphology import remove_small_objects, remove_small_holes
+from skimage.measure import label, regionprops
 from streamlit_image_coordinates import streamlit_image_coordinates
 
-st.set_page_config(page_title="Iterative Kern-Zählung — CNN V3", layout="wide")
-st.title("🧬 Iterative Kern-Zählung — CNN V3")
+st.set_page_config(page_title="Iterative Kern-Zählung — CNN Auto V3", layout="wide")
+st.title("🧬 Iterative Kern-Zählung — CNN Auto V3")
 
 # -------------------- Hilfsfunktionen --------------------
 def prepare_patch_for_model(patch, target_size=(256,256)):
@@ -63,6 +65,22 @@ def build_unet(input_shape=(256,256,1), base_filters=32, depth=4):
     model = models.Model(inputs,outputs)
     return model
 
+def postprocess_mask(mask, min_size=5):
+    """Postprocessing: kleine Objekte entfernen, kleine Löcher schließen"""
+    mask_bool = mask>0
+    mask_clean = remove_small_objects(mask_bool, min_size=min_size)
+    mask_clean = remove_small_holes(mask_clean, area_threshold=min_size)
+    return mask_clean.astype(np.uint8)
+
+def find_centers_from_mask(mask):
+    """Extrahiere Pixel-Zentren aus binärer Maske"""
+    lbl = label(mask)
+    centers = []
+    for r in regionprops(lbl):
+        cy,cx = r.centroid
+        centers.append((int(round(cx)),int(round(cy))))
+    return centers
+
 # -------------------- Session state --------------------
 for k in ["groups","all_points","last_file","disp_width","history","model"]:
     if k not in st.session_state:
@@ -90,6 +108,8 @@ with col2:
     st.sidebar.markdown("### Parameter")
     circle_radius = st.sidebar.slider("Marker-Radius (px, Display)",1,12,5)
     detection_threshold = st.sidebar.slider("Threshold für CNN-Detektion",0.01,0.99,0.5,0.01)
+    patch_size = st.sidebar.slider("Patch-Größe für CNN (px)",64,256,128,16)
+    min_object_size = st.sidebar.slider("Min. Objektgröße (px)",1,50,5)
 with col1:
     DISPLAY_WIDTH = st.slider("Anzeige-Breite (px)",300,1600,st.session_state.disp_width)
     st.session_state.disp_width=DISPLAY_WIDTH
@@ -121,68 +141,86 @@ if st.session_state.model is None:
     st.success("CNN-Modell bereit.")
 
 # -------------------- Sidebar actions --------------------
-mode = st.sidebar.radio("Aktion",["Kerne erkennen (Klick)","Punkt löschen","Undo letzte Aktion"])
+mode = st.sidebar.radio("Aktion",["Automatische Kern-Erkennung","Manuelle Korrektur (Klick)","Punkt löschen","Undo letzte Aktion"])
 if st.sidebar.button("Reset (Alle Gruppen)"):
     st.session_state.history.append(("reset",{"groups":st.session_state.groups.copy(),"all_points":st.session_state.all_points.copy()}))
     st.session_state.groups=[]
     st.session_state.all_points=[]
     st.success("Zurückgesetzt.")
 
-# -------------------- Click handling --------------------
-if coords:
+# -------------------- Auto-CNN-Erkennung --------------------
+if mode=="Automatische Kern-Erkennung":
+    st.info("CNN läuft über das ganze Bild...")
+    # Patch-Pooling
+    stride = patch_size//2
+    mask_total = np.zeros((H_orig,W_orig),dtype=np.float32)
+    for y in range(0,H_orig, stride):
+        for x in range(0,W_orig, stride):
+            y0 = y
+            x0 = x
+            y1 = min(y+patch_size,H_orig)
+            x1 = min(x+patch_size,W_orig)
+            patch = image_orig[y0:y1,x0:x1]
+            batch = prepare_patch_for_model(patch,target_size=(patch_size,patch_size))
+            pred = st.session_state.model.predict(batch)[0,...,0]
+            pred_resized = cv2.resize(pred,(x1-x0,y1-y0),interpolation=cv2.INTER_LINEAR)
+            mask_total[y0:y1,x0:x1] = np.maximum(mask_total[y0:y1,x0:x1], pred_resized)
+    # Postprocessing + Threshold
+    mask_bin = (mask_total>detection_threshold).astype(np.uint8)
+    mask_clean = postprocess_mask(mask_bin, min_size=min_object_size)
+    centers = find_centers_from_mask(mask_clean)
+    # Dedup
+    new_centers = dedup_new_points(centers, st.session_state.all_points, min_dist=5)
+    if new_centers:
+        color=PRESET_COLORS[len(st.session_state.groups)%len(PRESET_COLORS)]
+        st.session_state.groups.append({"points":new_centers,"color":color})
+        st.session_state.all_points.extend(new_centers)
+        st.success(f"Automatisch erkannte Kerne: {len(new_centers)}")
+    else:
+        st.info("Keine neuen Kerne erkannt.")
+
+# -------------------- Click handling (manual) --------------------
+if coords and mode=="Manuelle Korrektur (Klick)":
     x_disp,y_disp=int(coords["x"]),int(coords["y"])
     x_orig=int(round(x_disp/scale))
     y_orig=int(round(y_disp/scale))
+    # Füge Punkt hinzu
+    color=PRESET_COLORS[len(st.session_state.groups)%len(PRESET_COLORS)]
+    st.session_state.groups.append({"points":[(x_orig,y_orig)],"color":color})
+    st.session_state.all_points.append((x_orig,y_orig))
+    st.success("Punkt hinzugefügt.")
 
-    if mode=="Punkt löschen":
-        removed=[]
-        new_all=[]
-        for p in st.session_state.all_points:
-            if np.linalg.norm(np.array(p)-np.array([x_orig,y_orig]))<5:
-                removed.append(p)
-            else:
-                new_all.append(p)
-        if removed:
-            st.session_state.history.append(("delete_points",{"removed":removed}))
-            st.session_state.all_points=new_all
-            for g in st.session_state.groups:
-                g["points"]=[p for p in g["points"] if p not in removed]
-            st.success(f"{len(removed)} Punkt(e) gelöscht.")
+# Punkt löschen
+if coords and mode=="Punkt löschen":
+    x_disp,y_disp=int(coords["x"]),int(coords["y"])
+    x_orig=int(round(x_disp/scale))
+    y_orig=int(round(y_disp/scale))
+    removed=[]
+    new_all=[]
+    for p in st.session_state.all_points:
+        if np.linalg.norm(np.array(p)-np.array([x_orig,y_orig]))<5:
+            removed.append(p)
         else:
-            st.info("Kein Punkt in der Nähe gefunden.")
-    elif mode=="Undo letzte Aktion":
-        if st.session_state.history:
-            action,payload=st.session_state.history.pop()
-            if action=="reset":
-                st.session_state.groups=payload["groups"]
-                st.session_state.all_points=payload["all_points"]
-                st.success("Reset rückgängig gemacht.")
-        else:
-            st.info("Keine Aktion zum Rückgängig machen.")
+            new_all.append(p)
+    if removed:
+        st.session_state.history.append(("delete_points",{"removed":removed}))
+        st.session_state.all_points=new_all
+        for g in st.session_state.groups:
+            g["points"]=[p for p in g["points"] if p not in removed]
+        st.success(f"{len(removed)} Punkt(e) gelöscht.")
     else:
-        # -------------------- CNN-Erkennung --------------------
-        patch_radius=64
-        x_min=max(0,x_orig-patch_radius)
-        x_max=min(W_orig,x_orig+patch_radius)
-        y_min=max(0,y_orig-patch_radius)
-        y_max=min(H_orig,y_orig+patch_radius)
-        patch=image_orig[y_min:y_max,x_min:x_max]
-        batch=prepare_patch_for_model(patch)
-        pred=st.session_state.model.predict(batch)[0,...,0]
-        # Threshold
-        pred_bin=(pred>detection_threshold).astype(np.uint8)
-        # find centers
-        ys,xs=np.where(pred_bin>0)
-        centers_orig=[(x+x_min,y+y_min) for x,y in zip(xs,ys)]
-        # dedup
-        new_centers=dedup_new_points(centers_orig,st.session_state.all_points,min_dist=5)
-        if new_centers:
-            color=PRESET_COLORS[len(st.session_state.groups)%len(PRESET_COLORS)]
-            st.session_state.groups.append({"points":new_centers,"color":color})
-            st.session_state.all_points.extend(new_centers)
-            st.success(f"Neue Kerne: {len(new_centers)}")
-        else:
-            st.info("Keine neuen Kerne erkannt.")
+        st.info("Kein Punkt in der Nähe gefunden.")
+
+# Undo letzte Aktion
+if st.sidebar.button("Undo letzte Aktion"):
+    if st.session_state.history:
+        action,payload=st.session_state.history.pop()
+        if action=="reset":
+            st.session_state.groups=payload["groups"]
+            st.session_state.all_points=payload["all_points"]
+            st.success("Reset rückgängig gemacht.")
+    else:
+        st.info("Keine Aktion zum Rückgängig machen.")
 
 # -------------------- Ergebnis-Anzeige & Export --------------------
 st.markdown("## Ergebnisse")
@@ -204,4 +242,4 @@ with colB:
                 rows.append({"Group":i+1,"X_display":x_disp,"Y_display":y_disp,"X_original":x_orig,"Y_original":y_orig})
         df=pd.DataFrame(rows)
         st.download_button("📥 CSV exportieren",df.to_csv(index=False).encode("utf-8"),
-                           file_name="kern_gruppen_v3.csv",mime="text/csv")
+                           file_name="kern_gruppen_v3_auto.csv",mime="text/csv")
